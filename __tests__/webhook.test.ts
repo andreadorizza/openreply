@@ -515,3 +515,23 @@ describe("parseReadEvents", () => {
     expect(parseReadEvents(payload)).toHaveLength(0);
   });
 });
+
+describe("webhook subscription fields", () => {
+  it("subscribes to every field the webhook route consumes", async () => {
+    const { WEBHOOK_SUBSCRIBED_FIELDS } = await import("../lib/meta/client");
+
+    // The webhook route parses comments (parseCommentEvents), inbound DMs
+    // (parseMessageEvents), button postbacks (parsePostbackEvents), and read
+    // receipts (parseReadEvents). Meta only delivers a field per-account when
+    // it is in subscribed_fields, so dropping one here silently breaks the
+    // corresponding step of the DM flow.
+    expect(WEBHOOK_SUBSCRIBED_FIELDS).toEqual(
+      expect.arrayContaining([
+        "comments",
+        "messages",
+        "messaging_postbacks",
+        "messaging_seen",
+      ])
+    );
+  });
+});

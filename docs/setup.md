@@ -177,9 +177,11 @@ Still in the Instagram product, find the Configure webhooks step.
 - Callback URL: `https://your-app.vercel.app/api/webhook`
 - Verify token: the value of `WEBHOOK_VERIFY_TOKEN` from your environment
 - Click Verify and save. It should succeed immediately, because the app answers Meta's verification challenge. If the button is greyed out, click into the verify-token field and paste the token again; editing the callback URL often clears it.
-- Subscribe to the `comments` field, and to `messages` as well.
+- Subscribe to `comments`, `messages`, `messaging_postbacks`, and `messaging_seen`.
 
-Both fields matter. `comments` carries comment-to-DM, which is what most people come here for. `messages` carries inbound DMs and Story replies, which is what a campaign's "also reply when someone DMs these words" toggle runs on. Subscribe to `comments` alone and that toggle looks enabled but never fires, because the events it needs are never delivered.
+All four fields matter. `comments` carries comment-to-DM, which is what most people come here for. `messages` carries inbound DMs and Story replies, which is what a campaign's "also reply when someone DMs these words" toggle runs on. `messaging_postbacks` carries button taps, which drive the step after the opening DM, and `messaging_seen` carries read receipts, which drive the fallback that sends that step anyway when someone reads the opening DM without tapping. Miss one of the messaging fields and the flow stalls after the opening DM.
+
+The dashboard toggles alone are not enough: Meta also keeps a per-account field list, which OpenReply registers when you connect an Instagram account. If you connected an account on an older build (or the connect-time subscription failed), use the "Re-sync webhooks" button in Settings — it re-registers the account and reports which fields Meta actually has active, without a disconnect/reconnect.
 
 To test delivery without a real comment, click Test next to `comments`, then click Send to My Server. This is a two-step control. Clicking Test only previews the sample payload; the second button is what actually POSTs it to your endpoint. After sending, a row should appear in your `WebhookEvent` table.
 

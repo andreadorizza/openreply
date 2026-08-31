@@ -744,6 +744,19 @@ export async function refreshLongLivedToken(
   };
 }
 
+// Every webhook field the app consumes must be listed here: Meta delivers a
+// field per-account only when it is in subscribed_fields, regardless of the
+// App Dashboard toggles. Button-tap postbacks and read receipts arrive under
+// their own fields — without them the multi-step DM flow stalls after the
+// opening DM, since the reveal step is driven by messaging_postbacks (button
+// tap) and messaging_seen (5-minute read fallback).
+export const WEBHOOK_SUBSCRIBED_FIELDS = [
+  "comments",
+  "messages",
+  "messaging_postbacks",
+  "messaging_seen",
+];
+
 export async function subscribeInstagramAccountToWebhooks(
   instagramAccountId: string,
   accessToken: string
@@ -757,12 +770,37 @@ export async function subscribeInstagramAccountToWebhooks(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({
-        subscribed_fields: ["comments", "messages"],
+        subscribed_fields: WEBHOOK_SUBSCRIBED_FIELDS,
       }),
     }
   );
 
   return handleResponse(response);
+}
+
+export interface SubscribedApp {
+  id: string;
+  name?: string;
+  subscribed_fields?: string[];
+}
+
+/**
+ * The webhook fields Meta actually has active for this account — the ground
+ * truth for "why is a webhook not arriving", as opposed to what we asked for.
+ */
+export async function getSubscribedApps(
+  instagramAccountId: string,
+  accessToken: string
+): Promise<SubscribedApp[]> {
+  const response = await fetch(
+    `${instagramGraphBase()}/${instagramAccountId}/subscribed_apps`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }
+  );
+
+  const data = await handleResponse<{ data?: SubscribedApp[] }>(response);
+  return data.data ?? [];
 }
 
 export async function debugToken(inputToken: string, accessToken: string) {

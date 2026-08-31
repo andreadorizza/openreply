@@ -52,6 +52,7 @@ export default function SettingsPage() {
   );
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+  const [resyncMessage, setResyncMessage] = useState<string | null>(null);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"ADMIN" | "MEMBER">("MEMBER");
   const [memberError, setMemberError] = useState<string | null>(null);
@@ -86,6 +87,41 @@ export default function SettingsPage() {
       body: JSON.stringify({ instagramAccountId }),
     });
     window.location.reload();
+  }
+
+  async function resyncWebhooks() {
+    setBusy("resync");
+    setResyncMessage(null);
+    try {
+      const res = await fetch("/api/instagram/resubscribe", { method: "POST" });
+      const payload = await res.json();
+      if (!payload.success) {
+        setResyncMessage(payload.error ?? "Webhook re-sync failed");
+        return;
+      }
+      const lines = payload.data.results.map(
+        (result: {
+          username: string;
+          status: string;
+          missingFields: string[];
+          error?: string;
+        }) => {
+          if (result.status !== "subscribed") {
+            return `@${result.username}: failed${result.error ? ` — ${result.error}` : ""}`;
+          }
+          return result.missingFields.length > 0
+            ? `@${result.username}: subscribed, but Meta reports missing fields: ${result.missingFields.join(", ")}`
+            : `@${result.username}: all webhook fields active`;
+        }
+      );
+      setResyncMessage(
+        lines.length > 0 ? lines.join(" · ") : "No connected accounts to re-sync"
+      );
+    } catch {
+      setResyncMessage("Webhook re-sync failed");
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function inviteMember(event: React.FormEvent) {
@@ -208,14 +244,27 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="mt-6 pt-4 border-t border-border flex gap-3">
+        <div className="mt-6 pt-4 border-t border-border flex flex-wrap items-center gap-3">
           <a
             href="/api/instagram/connect"
             className="px-4 py-2 rounded text-sm font-medium transition-colors bg-accent text-white hover:bg-accent-hover"
           >
             {accounts.length > 0 ? "Connect another account" : "Connect Instagram"}
           </a>
+          {accounts.length > 0 && (
+            <button
+              type="button"
+              onClick={resyncWebhooks}
+              disabled={busy === "resync"}
+              className="px-4 py-2 rounded border border-border text-sm font-medium text-muted transition-colors hover:border-border-hover hover:text-foreground disabled:opacity-50"
+            >
+              {busy === "resync" ? "Re-syncing..." : "Re-sync webhooks"}
+            </button>
+          )}
         </div>
+        {resyncMessage && (
+          <p className="mt-3 text-xs text-muted">{resyncMessage}</p>
+        )}
       </section>
 
       <section className="panel rounded p-4 sm:p-6">
