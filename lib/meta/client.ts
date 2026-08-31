@@ -744,12 +744,11 @@ export async function refreshLongLivedToken(
   };
 }
 
-// Every webhook field the app consumes must be listed here: Meta delivers a
-// field per-account only when it is in subscribed_fields, regardless of the
-// App Dashboard toggles. Button-tap postbacks and read receipts arrive under
-// their own fields — without them the multi-step DM flow stalls after the
-// opening DM, since the reveal step is driven by messaging_postbacks (button
-// tap) and messaging_seen (5-minute read fallback).
+// Every webhook field the app consumes, matching what Meta's docs say must be
+// in the per-account subscribed_fields list. In practice Meta has been seen
+// delivering postbacks and read receipts with only "messages" registered, but
+// that is undocumented behavior — registering each consumed field keeps the
+// subscription aligned with the docs and with the App Dashboard toggles.
 export const WEBHOOK_SUBSCRIBED_FIELDS = [
   "comments",
   "messages",

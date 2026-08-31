@@ -522,9 +522,8 @@ describe("webhook subscription fields", () => {
 
     // The webhook route parses comments (parseCommentEvents), inbound DMs
     // (parseMessageEvents), button postbacks (parsePostbackEvents), and read
-    // receipts (parseReadEvents). Meta only delivers a field per-account when
-    // it is in subscribed_fields, so dropping one here silently breaks the
-    // corresponding step of the DM flow.
+    // receipts (parseReadEvents). Meta's docs require each consumed field to
+    // be in subscribed_fields, so the registration list must cover them all.
     expect(WEBHOOK_SUBSCRIBED_FIELDS).toEqual(
       expect.arrayContaining([
         "comments",
