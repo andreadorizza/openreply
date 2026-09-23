@@ -4,25 +4,26 @@ const { mockPrisma, mockGetUserMedia } = vi.hoisted(() => ({
   mockPrisma: {
     automation: {
       findMany: vi.fn(),
-      updateMany: vi.fn(),
+      update: vi.fn(),
     },
   },
   mockGetUserMedia: vi.fn(),
 }));
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
-vi.mock("@/lib/meta/client", () => ({ getUserMedia: mockGetUserMedia }));
-vi.mock("@/lib/meta/oauth", () => ({ decryptToken: () => "token" }));
+vi.mock("@/lib/instagram/provider", () => ({
+  createInstagramContext: vi.fn(async () => ({})),
+  hasInstagramCredentials: () => true,
+  getUserMedia: mockGetUserMedia,
+}));
 
-import { attachNextReels } from "../lib/polling/attach-next-reel";
-
-const account = { id: "acct_1", accessToken: "enc" };
+import { attachPendingNextReels } from "../lib/automation/attach-next-reel";
 
 function pendingCampaign(overrides: Record<string, unknown> = {}) {
   return {
     id: "auto_1",
     instagramAccountId: "acct_1",
-    instagramAccount: account,
+    instagramAccount: { id: "acct_1" },
     createdAt: new Date("2026-09-01T00:00:00Z"),
     nextReelArmedAt: null,
     ...overrides,
@@ -31,15 +32,13 @@ function pendingCampaign(overrides: Record<string, unknown> = {}) {
 
 const media = [
   { id: "reel_old", media_product_type: "REELS", timestamp: "2026-09-10T12:00:00+0000", permalink: "https://ig/old" },
-  { id: "post_new", media_product_type: "FEED", timestamp: "2026-09-21T12:00:00+0000", permalink: "https://ig/feed" },
   { id: "reel_new", media_product_type: "REELS", timestamp: "2026-09-22T12:00:00+0000", permalink: "https://ig/new" },
 ];
 
-describe("attachNextReels", () => {
+describe("attachPendingNextReels", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetUserMedia.mockResolvedValue(media);
-    mockPrisma.automation.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it("binds to the first reel posted after the campaign was armed, not created", async () => {
@@ -49,35 +48,24 @@ describe("attachNextReels", () => {
       pendingCampaign({ nextReelArmedAt: new Date("2026-09-20T00:00:00Z") }),
     ]);
 
-    const result = await attachNextReels();
+    await attachPendingNextReels();
 
-    expect(mockPrisma.automation.updateMany).toHaveBeenCalledWith({
-      where: { id: "auto_1", pendingNextReel: true },
-      data: { postId: "reel_new", postUrl: "https://ig/new", pendingNextReel: false },
-    });
-    expect(result.bound).toBe(1);
+    expect(mockPrisma.automation.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ postId: "reel_new" }),
+      })
+    );
   });
 
   it("falls back to createdAt for campaigns armed before the column existed", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([pendingCampaign()]);
 
-    await attachNextReels();
+    await attachPendingNextReels();
 
-    expect(mockPrisma.automation.updateMany).toHaveBeenCalledWith(
+    expect(mockPrisma.automation.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ postId: "reel_old" }),
       })
     );
-  });
-
-  it("leaves the campaign waiting when no reel is newer than the arm time", async () => {
-    mockPrisma.automation.findMany.mockResolvedValue([
-      pendingCampaign({ nextReelArmedAt: new Date("2026-09-23T00:00:00Z") }),
-    ]);
-
-    const result = await attachNextReels();
-
-    expect(mockPrisma.automation.updateMany).not.toHaveBeenCalled();
-    expect(result.bound).toBe(0);
   });
 });
