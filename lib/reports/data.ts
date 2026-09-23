@@ -1,9 +1,11 @@
 import { prisma } from "@/lib/db/client";
+import type { Locale } from "@/lib/i18n";
 import {
   calculateCtr,
   normalizeTopKeywords,
   summarizeDmStatuses,
 } from "@/lib/tracking/analytics";
+import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
 import { buildReportUrl, isReportBranded } from "@/lib/reports/share";
 
 function getHostname(url: string) {
@@ -25,7 +27,7 @@ function getDayWindow(daysAgo: number) {
   return { start, end };
 }
 
-export async function getCampaignReportBySlug(shareSlug: string) {
+export async function getCampaignReportBySlug(shareSlug: string, locale: Locale = "en") {
   const automation = await prisma.automation.findFirst({
     where: {
       reportShareSlug: shareSlug,
@@ -59,7 +61,7 @@ export async function getCampaignReportBySlug(shareSlug: string) {
           destinationUrl: true,
           _count: { select: { clicks: true } },
         },
-        orderBy: { createdAt: "asc" },
+        orderBy: TRACKED_LINK_ORDER,
       },
     },
   });
@@ -139,7 +141,7 @@ export async function getCampaignReportBySlug(shareSlug: string) {
       ]);
 
       return {
-        date: start.toLocaleDateString("en-US", {
+        date: start.toLocaleDateString(locale, {
           month: "short",
           day: "numeric",
         }),

@@ -32,8 +32,11 @@ import {
   getUserMedia,
   MetaApiError,
   type InstagramComment,
-} from "@/lib/meta/client";
-import { decryptToken } from "@/lib/meta/oauth";
+} from "@/lib/instagram/provider";
+import {
+  createInstagramContext,
+  type InstagramContext,
+} from "@/lib/instagram/provider";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 
 // Only consider comments from the last few days — older ones are outside
@@ -55,7 +58,8 @@ interface SweepStat {
 }
 
 function errMessage(error: unknown): string {
-  if (error instanceof MetaApiError) return `Meta ${error.code}: ${error.message}`;
+  if (error instanceof MetaApiError)
+    return `Meta ${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;
   return "Unknown error";
 }
@@ -80,16 +84,23 @@ export async function reconcileComments(): Promise<void> {
           instagramId: true,
           username: true,
           accessToken: true,
+          provider: true,
+          workspaceId: true,
+          zernioAccountId: true,
         },
       },
     },
   });
 
   const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
-  const tokenCache = new Map<string, string | null>();
+  const tokenCache = new Map<string, InstagramContext | null>();
 
   for (const automation of automations) {
-    const stat = await sweepCampaign(automation, sinceMs, tokenCache).catch(
+    const stat = await sweepCampaign({
+      automation: automation,
+      sinceMs: sinceMs,
+      tokenCache: tokenCache,
+    }).catch(
       (error): SweepStat => ({
         campaign: automation.name,
         keywords: automation.keywords.join(","),
@@ -103,7 +114,11 @@ export async function reconcileComments(): Promise<void> {
   }
 }
 
-async function sweepCampaign(
+async function sweepCampaign({
+  automation,
+  sinceMs,
+  tokenCache,
+}: {
   automation: {
     id: string;
     name: string;
@@ -118,11 +133,14 @@ async function sweepCampaign(
       instagramId: string;
       username: string;
       accessToken: string;
+      provider: "META" | "ZERNIO";
+      workspaceId: string;
+      zernioAccountId: string | null;
     };
-  },
-  sinceMs: number,
-  tokenCache: Map<string, string | null>
-): Promise<SweepStat> {
+  };
+  sinceMs: number;
+  tokenCache: Map<string, InstagramContext | null>;
+}): Promise<SweepStat> {
   const account = automation.instagramAccount;
   const stat: SweepStat = {
     campaign: automation.name,
@@ -139,7 +157,7 @@ async function sweepCampaign(
   let accessToken = tokenCache.get(account.id);
   if (accessToken === undefined) {
     try {
-      accessToken = decryptToken(account.accessToken);
+      accessToken = await createInstagramContext(account);
     } catch {
       accessToken = null;
     }
@@ -155,9 +173,13 @@ async function sweepCampaign(
   const mediaIds: string[] = [];
   if (automation.postId) {
     mediaIds.push(automation.postId);
+    mediaIds.push(...(await adMediaFor(automation.postId)));
   } else if (automation.matchAnyPost) {
     try {
-      const media = await getUserMedia(accessToken, RECENT_MEDIA_LIMIT);
+      const media = await getUserMedia({
+        context: accessToken,
+        limit: RECENT_MEDIA_LIMIT,
+      });
       mediaIds.push(...media.map((m) => m.id));
     } catch (error) {
       stat.errors.push(`Media list: ${errMessage(error)}`);
@@ -170,7 +192,11 @@ async function sweepCampaign(
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
     try {
-      comments = await getRecentMediaComments(accessToken, mediaId, sinceMs);
+      comments = await getRecentMediaComments({
+        context: accessToken,
+        mediaId: mediaId,
+        sinceMs: sinceMs,
+      });
     } catch (error) {
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
@@ -184,8 +210,11 @@ async function sweepCampaign(
 
       const matched = automation.matchAnyWord
         ? true
-        : matchKeywords(c.text ?? "", automation.keywords, automation.wholeWordMatch)
-            .matched;
+        : matchKeywords(
+            c.text ?? "",
+            automation.keywords,
+            automation.wholeWordMatch
+          ).matched;
       if (!matched) return false;
       stat.matched += 1;
 
@@ -210,9 +239,10 @@ async function sweepCampaign(
       where: {
         automationId: automation.id,
         commentId: { in: needsAction.map((c) => c.id) },
-        ...(automation.publicReplyEnabled
-          ? { publicReplySentAt: { not: null } }
-          : { status: "SENT" }),
+        AND: [
+          { OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }] },
+          ...(automation.publicReplyEnabled ? [{ OR: [{ publicReplySentAt: { not: null } }, { publicReplyDeliveryUnconfirmed: true }] }] : []),
+        ],
       },
       select: { commentId: true },
     });
@@ -232,11 +262,20 @@ async function sweepCampaign(
       // (publicReplySentAt / SENT), so re-processing a comment is safe.
       await queue.add("process-comment", {
         instagramAccountId: account.instagramId,
+        accountConnectionId: account.id,
         commentId: c.id,
         commentText: c.text ?? "",
         commenterId: c.from!.id,
         commenterName: c.from?.username,
         mediaId,
+        // When the sweep is looking at an ad, the campaign is bound to the post
+        // the ad was made from: without this the worker matches nothing and
+        // drops the comment, so the sweep would enqueue it again every five
+        // minutes and never deliver it.
+        originalMediaId:
+          automation.postId && mediaId !== automation.postId
+            ? automation.postId
+            : undefined,
         source: "POLLING",
       });
       stat.enqueued += 1;
@@ -244,6 +283,41 @@ async function sweepCampaign(
   }
 
   return stat;
+}
+
+/**
+ * Ad copies of a post, as seen in webhooks already received.
+ *
+ * Boosting a post gives it a second media id: comments left on the ad arrive
+ * with the ad's `media.id` and the post's id in `original_media_id`. The sweep
+ * would otherwise only ever look at the post itself, so a comment Meta fails to
+ * deliver on the ad is lost for good — exactly the case this safety net exists
+ * for, and the one where volume is highest.
+ *
+ * The ad ids are recovered from the webhooks themselves rather than from the
+ * ads API, which would need ads_management on top of the permissions the app
+ * already asks for. The trade-off: an ad becomes visible to the sweep only once
+ * a single comment on it has arrived. That is enough for the failure being
+ * covered here, where some webhooks arrive and others do not.
+ */
+export async function adMediaFor(postId: string): Promise<string[]> {
+  try {
+    const rows = await prisma.$queryRaw<{ mediaId: string | null }[]>`
+      SELECT DISTINCT change->'value'->'media'->>'id' AS "mediaId"
+      FROM "WebhookEvent" w,
+           jsonb_array_elements(w.payload::jsonb->'entry') entry,
+           jsonb_array_elements(entry->'changes') change
+      WHERE change->>'field' = 'comments'
+        AND change->'value'->'media'->>'original_media_id' = ${postId}
+        AND w."createdAt" > now() - interval '90 days'
+    `;
+    return rows
+      .map((r) => r.mediaId)
+      .filter((id): id is string => Boolean(id) && id !== postId);
+  } catch {
+    // A failure here must not stop the sweep: the post itself is still checked.
+    return [];
+  }
 }
 
 async function recordSweep(

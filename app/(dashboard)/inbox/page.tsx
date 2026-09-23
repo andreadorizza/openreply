@@ -10,6 +10,8 @@
  * surfaced verbatim when it applies.
  */
 
+import type { Locale } from "@/lib/i18n";
+import { useI18n } from "@/lib/i18n/provider";
 import { useCallback, useEffect, useRef, useState } from "react";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
 import { readCache, writeCache } from "@/lib/client-cache";
@@ -24,18 +26,19 @@ const CACHE_MAX_AGE_MS = 60_000;
 const convCacheKey = (accountId: string) => `inbox:convs:${accountId}`;
 const msgCacheKey = (conversationId: string) => `inbox:msgs:${conversationId}`;
 
-function formatTime(iso: string | null): string {
+function formatTime(iso: string | null, locale: Locale): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   const now = new Date();
   const sameDay = d.toDateString() === now.toDateString();
   return sameDay
-    ? d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
-    : d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    ? d.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" })
+    : d.toLocaleDateString(locale, { month: "short", day: "numeric" });
 }
 
 export default function InboxPage() {
+  const { t, locale } = useI18n();
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
   // Seed from the last-used account so a revisit can paint the cached
   // conversation list immediately, before the account list even loads.
@@ -57,6 +60,7 @@ export default function InboxPage() {
   const [sendError, setSendError] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const conversationRequests = useRef(new Set<string>());
 
   const active = conversations.find((c) => c.id === activeId) ?? null;
 
@@ -90,7 +94,8 @@ export default function InboxPage() {
 
   const loadConversations = useCallback(
     async (silent: boolean) => {
-      if (!selectedAccountId) return;
+      if (!selectedAccountId || conversationRequests.current.has(selectedAccountId)) return;
+      conversationRequests.current.add(selectedAccountId);
       if (!silent) setConvLoading(true);
       try {
         const res = await fetch(
@@ -108,6 +113,7 @@ export default function InboxPage() {
       } catch {
         if (!silent) setConvError("Failed to load conversations");
       } finally {
+        conversationRequests.current.delete(selectedAccountId);
         if (!silent) setConvLoading(false);
       }
     },
@@ -165,7 +171,7 @@ export default function InboxPage() {
   // Load + poll the open thread. Cached messages render instantly while a fresh
   // copy loads silently; opening a thread never shows a blank pane on revisit.
   useEffect(() => {
-    if (!activeId) return;
+    if (!activeId || active?.detailsUnavailable) return;
     const cached = readCache<ThreadMessage[]>(
       msgCacheKey(activeId),
       CACHE_MAX_AGE_MS
@@ -185,7 +191,7 @@ export default function InboxPage() {
       POLL_MS
     );
     return () => window.clearInterval(timer);
-  }, [activeId, loadMessages]);
+  }, [activeId, active?.detailsUnavailable, loadMessages]);
 
   // Keep the thread pinned to the latest message.
   useEffect(() => {
@@ -238,12 +244,12 @@ export default function InboxPage() {
         // Roll the optimistic message back and restore the draft so it's not lost.
         setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
         setDraft(text);
-        setSendError(data.error ?? "Failed to send message");
+        setSendError(data.error ?? t("Failed to send message"));
       }
     } catch {
       setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
       setDraft(text);
-      setSendError("Failed to send message");
+      setSendError(t("Failed to send message"));
     } finally {
       setSending(false);
     }
@@ -259,7 +265,7 @@ export default function InboxPage() {
   return (
     <div className="space-y-4">
       <div className="flex items-end justify-between gap-4">
-        <h1 className="text-lg font-semibold text-foreground">Inbox</h1>
+        <h1 className="text-lg font-semibold text-foreground">{t("Inbox")}</h1>
         {accounts.length > 1 && (
           <AccountSelect
             accounts={accounts}
@@ -279,15 +285,15 @@ export default function InboxPage() {
           }`}
         >
           <div className="shrink-0 border-b border-border px-4 py-3 text-sm font-semibold text-foreground">
-            Conversations
+            {t("Conversations")}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
             {convLoading ? (
-              <p className="px-4 py-6 text-sm text-muted">Loading…</p>
+              <p className="px-4 py-6 text-sm text-muted">{t("Loading…")}</p>
             ) : convError ? (
-              <p className="px-4 py-6 text-sm text-error">{convError}</p>
+              <p className="px-4 py-6 text-sm text-error">{convError === "Failed to load conversations" ? t("Failed to load conversations") : convError}</p>
             ) : conversations.length === 0 ? (
-              <p className="px-4 py-6 text-sm text-muted">No conversations yet.</p>
+              <p className="px-4 py-6 text-sm text-muted">{t("No conversations yet.")}</p>
             ) : (
               conversations.map((c) => {
                 const isActive = c.id === activeId;
@@ -302,16 +308,19 @@ export default function InboxPage() {
                   >
                     <div className="flex items-baseline justify-between gap-2">
                       <span className="truncate text-sm font-medium text-foreground">
-                        @{c.contact.username ?? "unknown"}
+                        {c.detailsUnavailable ? t("Details unavailable") : `@${c.contact.username ?? "unknown"}`}
                       </span>
                       <span className="shrink-0 text-[11px] text-zinc-500">
-                        {formatTime(c.updatedTime)}
+                        {formatTime(c.updatedTime, locale)}
                       </span>
                     </div>
+                    {c.detailsUnavailable && (
+                      <p className="mt-0.5 text-xs text-muted">{t("Instagram could not load this conversation.")}</p>
+                    )}
                     {c.lastMessage && (
                       <p className="mt-0.5 truncate text-xs text-muted">
-                        {c.lastMessage.fromMe ? "You: " : ""}
-                        {c.lastMessage.text || "(no text)"}
+                        {c.lastMessage.fromMe ? t("You: ") : ""}
+                        {c.lastMessage.text || t("(no text)")}
                       </p>
                     )}
                   </button>
@@ -328,7 +337,7 @@ export default function InboxPage() {
         >
           {!active ? (
             <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted">
-              Select a conversation to read and reply.
+              {t("Select a conversation to read and reply.")}
             </div>
           ) : (
             <>
@@ -337,20 +346,24 @@ export default function InboxPage() {
                   type="button"
                   onClick={() => setActiveId(null)}
                   className="-ml-1 rounded px-2 py-1 text-muted hover:text-foreground sm:hidden"
-                  aria-label="Back to conversations"
+                  aria-label={t("Back to conversations")}
                 >
-                  Back
+                  {t("Back")}
                 </button>
                 <span className="truncate">
-                  @{active.contact.username ?? "unknown"}
+                  {active.detailsUnavailable ? t("Details unavailable") : `@${active.contact.username ?? "unknown"}`}
                 </span>
               </div>
 
               <div ref={scrollRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
-                {threadLoading && messages.length === 0 ? (
-                  <p className="text-sm text-muted">Loading…</p>
+                {active.detailsUnavailable ? (
+                  <p role="status" className="text-sm text-muted">
+                    {t("Instagram could not load the details of this conversation. Other conversations are still available. You can check this chat in Instagram.")}
+                  </p>
+                ) : threadLoading && messages.length === 0 ? (
+                  <p className="text-sm text-muted">{t("Loading…")}</p>
                 ) : messages.length === 0 ? (
-                  <p className="text-sm text-muted">No messages.</p>
+                  <p className="text-sm text-muted">{t("No messages.")}</p>
                 ) : (
                   messages.map((m) => (
                     <div
@@ -370,7 +383,7 @@ export default function InboxPage() {
                             m.fromMe ? "text-white/70" : "text-zinc-500"
                           }`}
                         >
-                          {formatTime(m.createdTime)}
+                          {formatTime(m.createdTime, locale)}
                         </p>
                       </div>
                     </div>
@@ -384,20 +397,21 @@ export default function InboxPage() {
                 )}
                 <div className="flex items-end gap-2">
                   <textarea
+                    disabled={active.detailsUnavailable || !active.contact.id}
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
                     onKeyDown={handleKeyDown}
                     rows={1}
-                    placeholder="Write a reply…  (Enter to send, Shift+Enter for a new line)"
+                    placeholder={t("Write a reply…  (Enter to send, Shift+Enter for a new line)")}
                     className="max-h-32 min-h-[40px] flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                   />
                   <button
                     type="button"
                     onClick={() => void handleSend()}
-                    disabled={sending || !draft.trim()}
+                    disabled={sending || !draft.trim() || !active.contact.id || active.detailsUnavailable}
                     className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
                   >
-                    {sending ? "Sending…" : "Send"}
+                    {sending ? t("Sending…") : t("Send")}
                   </button>
                 </div>
               </div>
