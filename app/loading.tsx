@@ -4,15 +4,18 @@
 // straight away, so the app paints while those queries run.
 //
 // It stays static: reading the locale cookie here would turn every prerendered
-// page dynamic, so it shows the wordmark rather than translated text.
+// page dynamic, so the message is shown in English and Italian side by side.
 export default function Loading() {
   return (
     <div
-      className="flex min-h-dvh items-center justify-center"
+      className="flex min-h-dvh flex-col items-center justify-center gap-2 px-4 text-center"
       role="status"
-      aria-label="Loading"
     >
-      <p className="text-base font-semibold text-muted">OpenReply</p>
+      <p className="text-base font-semibold">OpenReply</p>
+      <p className="text-sm text-muted">Loading…</p>
+      <p className="text-sm text-muted" lang="it">
+        Caricamento in corso…
+      </p>
     </div>
   );
 }
