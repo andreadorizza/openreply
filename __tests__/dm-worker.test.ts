@@ -123,8 +123,12 @@ vi.mock("bullmq", () => {
       close: vi.fn(),
     };
   }
+  class UnrecoverableError extends Error {
+    name = "UnrecoverableError";
+  }
   return {
     Worker: MockWorker,
+    UnrecoverableError,
   };
 });
 
@@ -897,10 +901,37 @@ describe("DM Worker — one private reply per comment", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           status: "FAILED",
-          errorMessage: "The comment is invalid for a private reply",
+          errorMessage: expect.stringMatching(
+            /^The comment is invalid for a private reply — Instagram refused/
+          ),
         }),
       })
     );
+  });
+
+  it("should fail a refused private reply without BullMQ retries", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
+    mockSendPrivateReply.mockRejectedValue(
+      new Error("The comment is invalid for a private reply")
+    );
+
+    const processor = getProcessor();
+    // Retrying cannot change Meta's answer for this comment; it only produced
+    // three identical alerts 5 and 15 minutes apart.
+    await expect(processor(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+      message: "The comment is invalid for a private reply",
+    });
+  });
+
+  it("should keep retrying failures that can clear up", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
+    mockSendPrivateReply.mockRejectedValue(new Error("connect ETIMEDOUT"));
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.not.toMatchObject({
+      name: "UnrecoverableError",
+    });
   });
 
   it("should still fall back to plain text when the button template itself is rejected", async () => {

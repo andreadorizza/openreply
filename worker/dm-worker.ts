@@ -1,6 +1,7 @@
 import { createDMWorker } from "@/lib/queue/dm-worker";
 import { recordWorkerHeartbeat } from "@/lib/ops/worker-health";
 import { reconcileComments } from "@/lib/polling/comment-reconciler";
+import { attachNextReels } from "@/lib/polling/attach-next-reel";
 import os from "node:os";
 
 const worker = createDMWorker();
@@ -31,6 +32,15 @@ void heartbeat();
 const heartbeatTimer = setInterval(() => void heartbeat(), HEARTBEAT_INTERVAL_MS);
 
 async function poll() {
+  // Bind "next reel" campaigns first, so a reel posted since the last poll is
+  // swept in this same pass. The sweep's lookback picks up comments that
+  // arrived before the campaign was bound, which the webhook path dropped.
+  try {
+    await attachNextReels();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[DM Worker] Next-reel binding failed:", message);
+  }
   try {
     await reconcileComments();
   } catch (error) {

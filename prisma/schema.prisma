@@ -175,6 +175,10 @@ model Automation {
   postId         String?
   postUrl        String?
   pendingNextReel Boolean @default(false)
+  // When the campaign started waiting for its next reel. Only a reel posted
+  // after this binds it; createdAt is wrong for a campaign switched to "next
+  // reel" later, as it would bind to a reel that was already live.
+  nextReelArmedAt DateTime?
   matchAnyPost   Boolean @default(false)
   keywords       String[]
   matchAnyWord   Boolean @default(false)

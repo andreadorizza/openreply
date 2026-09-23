@@ -1,4 +1,4 @@
-import { Worker, type Job } from "bullmq";
+import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
   getDMQueue,
   getRedisConnection,
@@ -61,6 +61,37 @@ const NON_TEMPLATE_REJECTIONS = [
   /invalid for a private reply/i,
   /requested user cannot be found/i,
 ];
+
+// Every pattern above is a verdict on the comment or conversation, so the job
+// retries (5, 15, 45 minutes later) fail identically: three alerts for one
+// comment and a log row that reads like a transient outage.
+function isPermanentRejection(error: unknown): boolean {
+  if (error instanceof TokenExpiredError || error instanceof RateLimitError) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : "";
+  return NON_TEMPLATE_REJECTIONS.some((pattern) => pattern.test(message));
+}
+
+/**
+ * The error to rethrow from a failed send: permanent rejections become
+ * UnrecoverableError so BullMQ fails the job once instead of retrying it.
+ */
+function toJobError(error: unknown): unknown {
+  if (!isPermanentRejection(error)) return error;
+  return new UnrecoverableError(
+    error instanceof Error ? error.message : "Unknown error"
+  );
+}
+
+// Meta's "invalid for a private reply" names no cause. Instagram allows one
+// private reply per comment, only within 7 days, and only while the comment
+// exists, so say that in the log instead of leaving the raw error.
+function describeSendFailure(error: unknown): string {
+  const message = formatError(error);
+  if (!/invalid for a private reply/i.test(message)) return message;
+  return `${message} — Instagram refused a private reply for this comment. Usually it already received one (from another tool or "Reply privately" in the app), it was deleted, or it is older than 7 days.`;
+}
 
 function isTemplateRejection(error: unknown): boolean {
   if (error instanceof TokenExpiredError || error instanceof RateLimitError) {
@@ -673,10 +704,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         data: {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
-          errorMessage: formatError(error),
+          errorMessage: describeSendFailure(error),
         },
       });
-      throw error;
+      throw toJobError(error);
     }
   }
 }
@@ -883,7 +914,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       },
       update: { status: "FAILED", errorMessage: formatError(error) },
     });
-    throw error;
+    throw toJobError(error);
   }
 }
 
@@ -1181,7 +1212,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           errorMessage: formatError(error),
         },
       });
-      throw error;
+      throw toJobError(error);
     }
   }
 }
