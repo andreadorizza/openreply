@@ -391,6 +391,7 @@ export async function POST(request: NextRequest) {
       postId: isSpecificPost ? parsed.data.postId : null,
       postUrl: isSpecificPost ? parsed.data.postUrl : null,
       pendingNextReel,
+      nextReelArmedAt: pendingNextReel ? new Date() : null,
       matchAnyPost,
       keywords: matchAnyWord ? [] : parsed.data.keywords,
       matchAnyWord,
@@ -536,9 +537,19 @@ export async function PATCH(request: NextRequest) {
     automationData.publicReplyMessage = null;
   }
 
+  // Switching to "next reel" means the reel posted from now on, not the first
+  // one since the campaign was created. Saving a campaign that is already
+  // waiting keeps its original arm time.
+  let nextReelArmedAt: Date | null | undefined;
+  if (automationData.pendingNextReel === true && !existing.pendingNextReel) {
+    nextReelArmedAt = new Date();
+  } else if (automationData.pendingNextReel === false) {
+    nextReelArmedAt = null;
+  }
+
   const updated = await prisma.automation.update({
     where: { id: automationId },
-    data: automationData,
+    data: { ...automationData, nextReelArmedAt },
   });
 
   // Update, create, or clear the campaign's primary tracked link when a
