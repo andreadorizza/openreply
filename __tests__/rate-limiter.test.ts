@@ -38,17 +38,18 @@ import {
   releaseDMSlot,
   pauseDMSends,
   recordThreadRefusal,
-  clearAccountBlock,
+  recordDelivery,
   commentDmIntervalMs,
   RATE_LIMIT_MAX,
   REQUEUE_DELAY_MS,
   META_PAUSE_MS,
   META_PAUSE_JITTER_MS,
-  MAX_PACED_REQUEUE_ATTEMPTS,
+  MAX_HELD_REQUEUE_ATTEMPTS,
   MAX_PACED_HOLD_MS,
   THREAD_REFUSAL_WINDOW_MS,
   THREAD_REFUSAL_BURST,
   ACCOUNT_BLOCK_MEMORY_MS,
+  DELIVERIES_TO_CLEAR_BLOCK,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -108,10 +109,11 @@ describe("reserveDMSlot", () => {
 
     expect(mockEval).toHaveBeenCalledWith(
       expect.any(String),
-      3,
+      4,
       "rate:dm:account_123",
       "rate:dm:pause:account_123",
       "rate:dm:next:account_123",
+      "rate:dm:held:account_123:-",
       RATE_LIMIT_MAX,
       3600,
       0, // pacing off unless COMMENT_DM_MAX_PER_HOUR is set
@@ -149,6 +151,15 @@ describe("reserveDMSlot", () => {
     expect(result.shouldRequeue).toBe(true);
     expect(result.requeueDelayMs).toBeGreaterThanOrEqual(240_000);
     expect(result.requeueDelayMs).toBeLessThan(240_000 + META_PAUSE_JITTER_MS);
+  });
+
+  it("keeps holding through a long pause, not only three times", async () => {
+    mockEval.mockResolvedValue([0, 12, 0, 240_000]);
+
+    expect((await reserveDMSlot("account_123", 3)).shouldRequeue).toBe(true);
+    expect(
+      (await reserveDMSlot("account_123", MAX_HELD_REQUEUE_ATTEMPTS)).shouldSkip
+    ).toBe(true);
   });
 
   it("should skip after max requeue attempts", async () => {
@@ -241,13 +252,14 @@ describe("reserveDMSlot with pacing", () => {
     process.env.COMMENT_DM_MAX_PER_HOUR = "90";
     mockEval.mockResolvedValue([1, 5, RATE_LIMIT_MAX - 5]);
 
-    const result = await reserveDMSlot("account_123", 1, 1_800_000_040_000);
+    const result = await reserveDMSlot("account_123", 1, 1_800_000_040_000, "c_1");
 
     expect(result.allowed).toBe(true);
     const args = mockEval.mock.calls[0];
-    expect(args[6]).toBe(3600);
-    expect(args[7]).toBe(40_000);
-    expect(args[8]).toBe(1_800_000_040_000);
+    expect(args[5]).toBe("rate:dm:held:account_123:c_1");
+    expect(args[7]).toBe(3600);
+    expect(args[8]).toBe(40_000);
+    expect(args[9]).toBe(1_800_000_040_000);
   });
 
   it("holds a comment for its slot and returns the slot", async () => {
@@ -266,8 +278,18 @@ describe("reserveDMSlot with pacing", () => {
 
     expect((await reserveDMSlot("account_123", 3)).shouldRequeue).toBe(true);
     expect(
-      (await reserveDMSlot("account_123", MAX_PACED_REQUEUE_ATTEMPTS)).shouldSkip
+      (await reserveDMSlot("account_123", MAX_HELD_REQUEUE_ATTEMPTS)).shouldSkip
     ).toBe(true);
+  });
+
+  it("flags a job for a comment that already holds a slot as a duplicate", async () => {
+    mockEval.mockResolvedValue([0, 5, 0, 0, -2, 1_800_000_040_000]);
+
+    const result = await reserveDMSlot("account_123", 0, 0, "c_1");
+
+    expect(result.duplicate).toBe(true);
+    expect(result.shouldSkip).toBe(false);
+    expect(result.shouldRequeue).toBe(false);
   });
 
   it("skips a comment when the schedule is already a day deep", async () => {
@@ -287,9 +309,10 @@ describe("account-wide block", () => {
     await expect(recordThreadRefusal("account_123", "commenter_1")).resolves.toBe(true);
     expect(mockEval).toHaveBeenCalledWith(
       expect.any(String),
-      2,
+      3,
       "rate:dm:refused:account_123",
       "rate:dm:blocked:account_123",
+      "rate:dm:delivered:account_123",
       expect.any(Number),
       THREAD_REFUSAL_WINDOW_MS,
       THREAD_REFUSAL_BURST,
@@ -304,14 +327,18 @@ describe("account-wide block", () => {
     await expect(recordThreadRefusal("account_123", "commenter_1")).resolves.toBe(false);
   });
 
-  it("forgets the block and the refusal count after a delivered DM", async () => {
-    mockDel.mockResolvedValue(2);
+  it("counts deliveries towards forgetting a block", async () => {
+    mockEval.mockResolvedValue(1);
 
-    await clearAccountBlock("account_123");
-
-    expect(mockDel).toHaveBeenCalledWith(
+    await expect(recordDelivery("account_123")).resolves.toBe(true);
+    expect(mockEval).toHaveBeenCalledWith(
+      expect.any(String),
+      3,
       "rate:dm:blocked:account_123",
-      "rate:dm:refused:account_123"
+      "rate:dm:refused:account_123",
+      "rate:dm:delivered:account_123",
+      DELIVERIES_TO_CLEAR_BLOCK,
+      ACCOUNT_BLOCK_MEMORY_MS
     );
   });
 });

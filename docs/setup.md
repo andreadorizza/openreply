@@ -134,7 +134,7 @@ Optional, for busy posts:
 | --- | --- | --- |
 | `COMMENT_DM_MAX_PER_HOUR` | unset (no pacing) | Spaces comment DMs evenly, at most this many per hour per account. Comments over the rate wait in the queue for their turn, up to a day. Instagram can refuse every new conversation from an account well below Meta's documented 750 private replies an hour; one account was blocked for hours at about 150 an hour, so start around `90`. |
 
-Separately from pacing, the worker treats several "thread owner has archived or deleted this conversation" refusals from different commenters within 10 minutes as Instagram blocking the whole account: it pauses comment DMs for 30 minutes and holds those comments instead of failing them.
+Separately from pacing, the worker treats several "thread owner has archived or deleted this conversation" refusals from different commenters within 10 minutes as Instagram blocking the whole account: it pauses comment DMs for 30 minutes and holds those comments instead of failing them, until three DMs in a row go through. Without pacing, held comments all come back when a pause ends; with pacing they come back one by one.
 
 ## Connect through Zernio
 

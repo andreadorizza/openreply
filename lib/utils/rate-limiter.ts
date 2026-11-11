@@ -34,9 +34,10 @@ const META_PAUSE_JITTER_MS = 2 * 60 * 1000;
 // gives each comment DM its own time slot, evenly spaced, and comments over the
 // rate wait in the queue for theirs instead of being dropped.
 //
-// A paced hold is a scheduled slot, not a failed try, and a long Instagram block
-// re-holds every queued comment once per pause, so the requeue budget is larger.
-const MAX_PACED_REQUEUE_ATTEMPTS = 48;
+// A paced hold or a hold for a pause is a wait, not a failed try, and a long
+// Instagram block re-holds every queued comment once per pause, so these get a
+// larger requeue budget than the hourly cap's.
+const MAX_HELD_REQUEUE_ATTEMPTS = 48;
 // Never schedule further out than this; the comment is skipped instead. A DM a
 // day late is already a poor answer, and Instagram stops allowing a private
 // reply 7 days after the comment.
@@ -56,8 +57,10 @@ const THREAD_REFUSAL_BURST = 3;
 // about half an hour after the retries stopped.
 const ACCOUNT_BLOCK_PAUSE_MS = 30 * 60 * 1000;
 // While a block is remembered, a single refusal counts as the block still
-// being on. A delivered comment DM clears it.
+// being on. It is cleared by this many delivered comment DMs in a row, not one:
+// people who already had a thread with the account still get DMs mid-block.
 const ACCOUNT_BLOCK_MEMORY_MS = 6 * 60 * 60 * 1000;
+const DELIVERIES_TO_CLEAR_BLOCK = 3;
 
 let redis: Redis | null = null;
 
@@ -81,6 +84,9 @@ export interface RateLimitResult {
   // Pacing only: the time (ms since epoch) of the slot this hold reserved. The
   // job carries it back, and a job that arrives at its slot sends right away.
   slotAt?: number;
+  // Pacing only: another job already holds a slot for this comment, so this one
+  // is a duplicate (a sweep or webhook retry) and should leave the DM to it.
+  duplicate?: boolean;
 }
 
 /**
@@ -93,10 +99,12 @@ export function commentDmIntervalMs(): number {
   return Math.ceil(3_600_000 / Math.min(perHour, RATE_LIMIT_MAX));
 }
 
-// With pacing on, KEYS[3] holds when the account's next send slot is free.
-// A job outside a pause that arrives at its own slot (ARGV[4]) sends without
-// queueing again; any other job takes the next free slot, which during a pause
-// is after the pause, so held jobs come back spaced out rather than at once.
+// With pacing on, KEYS[3] holds when the account's next send slot is free and
+// KEYS[4] the slot held for this comment, if any. A job outside a pause that
+// arrives at its own slot (ARGV[4]) sends without queueing again. Any other job
+// for a comment that already holds a live slot is a duplicate and gets none.
+// The rest take the next free slot, which during a pause is after the pause, so
+// held jobs come back spaced out rather than at once.
 const RESERVE_DM_SLOT_SCRIPT = `
 local current = tonumber(redis.call("GET", KEYS[1]) or "0")
 local max = tonumber(ARGV[1])
@@ -114,10 +122,20 @@ if paused_ms < 0 then
 end
 
 if interval > 0 then
+  local free_at = tonumber(redis.call("GET", KEYS[3]) or "0")
   local owns_slot = paused_ms == 0 and slot_at > 0 and
     slot_at <= now + early and slot_at >= now - late
-  if not owns_slot then
-    local free_at = tonumber(redis.call("GET", KEYS[3]) or "0")
+  if owns_slot then
+    redis.call("DEL", KEYS[4])
+    -- A late owner still counts as a send now: keep the next one an interval away.
+    if free_at < now + interval then
+      redis.call("SET", KEYS[3], now + interval, "PX", interval)
+    end
+  else
+    local held = tonumber(redis.call("GET", KEYS[4]) or "0")
+    if held > 0 and held ~= slot_at and held >= now - late then
+      return {0, current, 0, paused_ms, -2, held}
+    end
     if free_at < now + paused_ms then
       free_at = now + paused_ms
     end
@@ -127,8 +145,10 @@ if interval > 0 then
         return {0, current, 0, paused_ms, -1, 0}
       end
       redis.call("SET", KEYS[3], free_at + interval, "PX", wait + interval)
+      redis.call("SET", KEYS[4], free_at, "PX", wait + late + 1000)
       return {0, current, 0, paused_ms, wait, free_at}
     end
+    redis.call("DEL", KEYS[4])
     redis.call("SET", KEYS[3], now + interval, "PX", interval)
   end
 elseif paused_ms > 0 then
@@ -200,6 +220,14 @@ function accountBlockKey(instagramAccountId: string): string {
   return `rate:dm:blocked:${instagramAccountId}`;
 }
 
+function deliveryStreakKey(instagramAccountId: string): string {
+  return `rate:dm:delivered:${instagramAccountId}`;
+}
+
+function heldCommentKey(instagramAccountId: string, commentId?: string): string {
+  return `rate:dm:held:${instagramAccountId}:${commentId ?? "-"}`;
+}
+
 // Never shortens a pause already running: a 15-minute rate-limit pause must not
 // cut a 30-minute block pause short.
 const EXTEND_PAUSE_SCRIPT = `
@@ -230,6 +258,7 @@ export async function pauseDMSends(
 const RECORD_THREAD_REFUSAL_SCRIPT = `
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
+redis.call("DEL", KEYS[3])
 redis.call("ZADD", KEYS[1], now, ARGV[5])
 redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", now - window)
 redis.call("PEXPIRE", KEYS[1], window)
@@ -252,9 +281,10 @@ export async function recordThreadRefusal(
 ): Promise<boolean> {
   const result = await getRedis().eval(
     RECORD_THREAD_REFUSAL_SCRIPT,
-    2,
+    3,
     threadRefusalsKey(instagramAccountId),
     accountBlockKey(instagramAccountId),
+    deliveryStreakKey(instagramAccountId),
     Date.now(),
     THREAD_REFUSAL_WINDOW_MS,
     THREAD_REFUSAL_BURST,
@@ -264,15 +294,37 @@ export async function recordThreadRefusal(
   return toScriptNumber(result) === 1;
 }
 
+// Only while a block is remembered: count deliveries since the last refusal,
+// and forget the block (and the refusal count) after enough in a row.
+const RECORD_DELIVERY_SCRIPT = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+  return 0
+end
+local streak = redis.call("INCR", KEYS[3])
+redis.call("PEXPIRE", KEYS[3], ARGV[2])
+if streak >= tonumber(ARGV[1]) then
+  redis.call("DEL", KEYS[1], KEYS[2], KEYS[3])
+  return 1
+end
+return 0
+`;
+
 /**
- * A comment DM was delivered, so any block is over: forget it, and start the
- * refusal count again so one refusal right after cannot look like a burst.
+ * A comment DM was delivered. Once DELIVERIES_TO_CLEAR_BLOCK arrive with no
+ * refusal in between, a remembered block is over and is forgotten. Returns
+ * true when this delivery cleared it.
  */
-export async function clearAccountBlock(instagramAccountId: string): Promise<void> {
-  await getRedis().del(
+export async function recordDelivery(instagramAccountId: string): Promise<boolean> {
+  const result = await getRedis().eval(
+    RECORD_DELIVERY_SCRIPT,
+    3,
     accountBlockKey(instagramAccountId),
-    threadRefusalsKey(instagramAccountId)
+    threadRefusalsKey(instagramAccountId),
+    deliveryStreakKey(instagramAccountId),
+    DELIVERIES_TO_CLEAR_BLOCK,
+    ACCOUNT_BLOCK_MEMORY_MS
   );
+  return toScriptNumber(result) === 1;
 }
 
 /**
@@ -340,17 +392,19 @@ export async function checkRateLimit(
 export async function reserveDMSlot(
   instagramAccountId: string,
   requeueAttempt: number = 0,
-  slotAt: number = 0
+  slotAt: number = 0,
+  commentId?: string
 ): Promise<RateLimitResult> {
   const client = getRedis();
   const key = `rate:dm:${instagramAccountId}`;
 
   const result = await client.eval(
     RESERVE_DM_SLOT_SCRIPT,
-    3,
+    4,
     key,
     pauseKey(instagramAccountId),
     nextSlotKey(instagramAccountId),
+    heldCommentKey(instagramAccountId, commentId),
     RATE_LIMIT_MAX,
     RATE_LIMIT_WINDOW,
     commentDmIntervalMs(),
@@ -368,7 +422,6 @@ export async function reserveDMSlot(
 
   if (allowedFlag !== 1 && values.length > 4) {
     const holdMs = toScriptNumber(values[4]);
-    // The schedule is already a day deep: skip rather than queue further out.
     if (holdMs < 0) {
       return {
         allowed: false,
@@ -376,15 +429,18 @@ export async function reserveDMSlot(
         remainingDMs: 0,
         shouldRequeue: false,
         requeueDelayMs: 0,
-        shouldSkip: true,
+        // -2: another job already holds this comment's slot.
+        // -1: the schedule is already a day deep; skip rather than queue further.
+        shouldSkip: holdMs !== -2,
         reserved: false,
+        ...(holdMs === -2 ? { duplicate: true } : {}),
       };
     }
     return blockedResult(
       count,
       requeueAttempt,
       holdMs,
-      MAX_PACED_REQUEUE_ATTEMPTS,
+      MAX_HELD_REQUEUE_ATTEMPTS,
       toScriptNumber(values[5])
     );
   }
@@ -394,7 +450,8 @@ export async function reserveDMSlot(
       ? blockedResult(
           count,
           requeueAttempt,
-          pausedMs + Math.floor(Math.random() * META_PAUSE_JITTER_MS)
+          pausedMs + Math.floor(Math.random() * META_PAUSE_JITTER_MS),
+          MAX_HELD_REQUEUE_ATTEMPTS
         )
       : blockedResult(count, requeueAttempt);
   }
@@ -480,10 +537,11 @@ export {
   MAX_REQUEUE_ATTEMPTS,
   META_PAUSE_MS,
   META_PAUSE_JITTER_MS,
-  MAX_PACED_REQUEUE_ATTEMPTS,
+  MAX_HELD_REQUEUE_ATTEMPTS,
   MAX_PACED_HOLD_MS,
   THREAD_REFUSAL_WINDOW_MS,
   THREAD_REFUSAL_BURST,
   ACCOUNT_BLOCK_PAUSE_MS,
   ACCOUNT_BLOCK_MEMORY_MS,
+  DELIVERIES_TO_CLEAR_BLOCK,
 };
