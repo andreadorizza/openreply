@@ -85,6 +85,7 @@ model Workspace {
   linkClicks        LinkClick[]
   webhookEvents     WebhookEvent[]
   operationalEvents OperationalEvent[]
+  serviceKeys       ServiceKey[]
 
   @@index([ownerId])
 }
@@ -101,6 +102,21 @@ model WorkspaceMember {
 
   @@unique([workspaceId, userId])
   @@index([userId])
+}
+
+model ServiceKey {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  tokenHash   String    @unique
+  scopes      String[]
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
 }
 
 model WorkspaceInvitation {
@@ -305,6 +321,9 @@ model LinkClick {
   instagramAccountId String
   trackedLinkId      String
   ipHash             String?
+  // Token from the link's `?r=` (hashRecipientId), set on links sent in a DM.
+  // Clicks are counted once per recipient, falling back to ipHash without it.
+  recipientHash      String?
   userAgent          String?
   referrer           String?
   createdAt          DateTime @default(now())
