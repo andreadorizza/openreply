@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const {
   mockPrisma,
@@ -29,6 +29,7 @@ const {
       findFirst: vi.fn(),
       upsert: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
       create: vi.fn(),
     },
     instagramAccount: {
@@ -136,7 +137,10 @@ vi.mock("bullmq", () => {
   };
 });
 
+import { MetaApiError, RateLimitError } from "@/lib/meta/client";
 import { createDMWorker } from "../lib/queue/dm-worker";
+import { getRedisConnection } from "@/lib/queue/client";
+import { hashRecipientId } from "@/lib/tracking/server";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -234,7 +238,8 @@ beforeEach(() => {
       args.where?.status === "SENT" ? null : { commenterName: "commenter_user" }
   );
   mockPrisma.dmLog.upsert.mockResolvedValue({});
-  mockPrisma.dmLog.update.mockResolvedValue({});
+  mockPrisma.dmLog.update.mockReset().mockResolvedValue({});
+  mockPrisma.dmLog.updateMany.mockReset().mockResolvedValue({ count: 1 });
   mockPrisma.instagramAccount.findUnique.mockResolvedValue({
     workspaceId: "workspace_123",
   });
@@ -485,7 +490,7 @@ describe("DM Worker — Full Pipeline", () => {
   });
 
   it("should log FAILED, release usage, and re-throw when private reply sending fails", async () => {
-    const error = new Error("API Error");
+    const error = new RateLimitError("API Error");
     mockSendPrivateReply.mockRejectedValue(error);
 
     const processor = getProcessor();
@@ -580,15 +585,17 @@ describe("DM Worker — Full Pipeline", () => {
     await processor(createMockJob());
 
     // Primary button title comes from linkButtonLabel; the second from its
-    // own stored label. Both point at their tracked /r/<slug> URLs.
+    // own stored label. Both point at their tracked /r/<slug> URLs, tagged
+    // with the commenter's recipient token.
+    const token = hashRecipientId(mockJobData.commenterId);
     expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledWith(
       "decrypted_token",
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the offer:",
       [
-        { title: "Get offer", url: "http://localhost:3000/r/abc123" },
-        { title: "Book a call", url: "http://localhost:3000/r/def456" },
+        { title: "Get offer", url: `http://localhost:3000/r/abc123?r=${token}` },
+        { title: "Book a call", url: `http://localhost:3000/r/def456?r=${token}` },
       ]
     );
   });
@@ -658,7 +665,12 @@ describe("DM Worker — Full Pipeline", () => {
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the offer:",
-      [{ title: "Get offer", url: "http://localhost:3000/r/abc123" }]
+      [
+        {
+          title: "Get offer",
+          url: `http://localhost:3000/r/abc123?r=${hashRecipientId(mockJobData.commenterId)}`,
+        },
+      ]
     );
   });
 
@@ -691,7 +703,7 @@ describe("DM Worker — Full Pipeline", () => {
       "comment_555",
       "Hey commenter_user, welcome!",
       "Get the link",
-      "followcheck:auto_789"
+      "followcheck:auto_789:open"
     );
     // Follow status is verified on the tap, not at comment time.
     expect(mockGetUserFollowStatus).not.toHaveBeenCalled();
@@ -781,6 +793,31 @@ describe("DM Worker — Full Pipeline", () => {
     expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
   });
 
+  it("should not let a read fallback through when follow status is unverifiable", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...mockAutomation,
+      requireFollow: true,
+      trackedLinks: [],
+    });
+    // Instagram answers "User consent is required" until the person taps a
+    // button, which is exactly the case of someone who only read the DM.
+    mockGetUserFollowStatus.mockResolvedValue(null);
+
+    const processor = getProcessor();
+    await processor(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789",
+        fallback: true,
+      })
+    );
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+  });
+
   it("should deliver a follow-gated read fallback once the user follows", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([]);
     mockPrisma.automation.findFirst.mockResolvedValue({
@@ -815,7 +852,7 @@ describe("DM Worker — Full Pipeline", () => {
       trackedLinks: [],
     });
     mockSendDirectMessage.mockRejectedValue(
-      new Error("This message is sent outside of allowed window.")
+      new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
     );
 
     const processor = getProcessor();
@@ -901,7 +938,7 @@ describe("DM Worker — one private reply per comment", () => {
       },
     ]);
     mockSendPrivateReplyWithLinkButton.mockRejectedValue(
-      new Error("The comment is invalid for a private reply")
+      new MetaApiError(100, undefined, undefined, "The comment is invalid for a private reply")
     );
 
     const processor = getProcessor();
@@ -921,7 +958,7 @@ describe("DM Worker — one private reply per comment", () => {
         data: expect.objectContaining({
           status: "FAILED",
           errorMessage: expect.stringMatching(
-            /^The comment is invalid for a private reply — Instagram refused/
+            /The comment is invalid for a private reply — Instagram refused/
           ),
         }),
       })
@@ -931,7 +968,7 @@ describe("DM Worker — one private reply per comment", () => {
   it("should fail a refused private reply without BullMQ retries", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
     mockSendPrivateReply.mockRejectedValue(
-      new Error("The comment is invalid for a private reply")
+      new MetaApiError(100, 2534025, undefined, "The comment is invalid for a private reply")
     );
 
     const processor = getProcessor();
@@ -939,13 +976,15 @@ describe("DM Worker — one private reply per comment", () => {
     // three identical alerts 5 and 15 minutes apart.
     await expect(processor(createMockJob())).rejects.toMatchObject({
       name: "UnrecoverableError",
-      message: "The comment is invalid for a private reply",
+      message: expect.stringContaining("The comment is invalid for a private reply"),
     });
   });
 
   it("should keep retrying failures that can clear up", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
-    mockSendPrivateReply.mockRejectedValue(new Error("connect ETIMEDOUT"));
+    mockSendPrivateReply.mockRejectedValue(
+      new RateLimitError("The rate limit has exceeded. Please retry again after some time")
+    );
 
     const processor = getProcessor();
     await expect(processor(createMockJob())).rejects.not.toMatchObject({
@@ -967,7 +1006,7 @@ describe("DM Worker — one private reply per comment", () => {
       },
     ]);
     mockSendPrivateReplyWithLinkButton.mockRejectedValue(
-      new Error("Unsupported message template")
+      new MetaApiError(100, undefined, undefined, "Unsupported message template")
     );
 
     const processor = getProcessor();
@@ -1417,7 +1456,15 @@ describe("durable Zernio postback delivery", () => {
     try {
       const process = getProcessor();
       const followTap = tap("follow");
-      followTap.data = { ...followTap.data, payload: "followcheck:auto_789" };
+      // The prompt goes out on the last delayed re-check — an earlier false
+      // only queues the next one — so exercise that pass: that is where the
+      // prompt is sent, and where a redelivery must not send it a second time.
+      followTap.data = {
+        ...followTap.data,
+        payload: "followcheck:auto_789",
+        followRecheck: true,
+        followRecheckAttempt: 2,
+      };
       await process(followTap);
       await process({ ...followTap, id: "redelivery" });
       expect(
@@ -1427,4 +1474,322 @@ describe("durable Zernio postback delivery", () => {
       vi.unstubAllGlobals();
     }
   });
+});
+
+describe("DM Worker — follow-gate re-check", () => {
+  const gated = { ...mockAutomation, requireFollow: true, trackedLinks: [] };
+
+  it("re-checks a first false follow later instead of rejecting the tap", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+      })
+    );
+
+    // Nothing is sent yet: a brand-new follow may simply not have registered.
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ followRecheck: true, userId: "commenter_999" }),
+      expect.objectContaining({ delay: expect.any(Number) })
+    );
+  });
+
+  it("prompts and records the rejection when the last re-check still finds no follow", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+        followRecheck: true,
+        followRecheckAttempt: 2,
+      })
+    );
+
+    expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          message: "Follow gate rejected a button tap",
+        }),
+      })
+    );
+    // A re-check never queues another re-check.
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("buckets the re-check id by time so a later tap is not blocked by an old job", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+      })
+    );
+
+    const [, , opts] = mockQueueAdd.mock.calls[0];
+    // A fixed per-user id would collide with the retained completed job of an
+    // earlier re-check and be dropped silently by BullMQ.
+    expect(opts.jobId).toMatch(/^postback_recheck_auto_789_commenter_999_1_\d+$/);
+  });
+
+  it("checks twice: soon after the tap, then again before giving up", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+    const tap = {
+      instagramAccountId: "ig_456",
+      userId: "commenter_999",
+      payload: "followcheck:auto_789",
+    };
+
+    await getProcessor()(createMockPostbackJob(tap));
+    expect(mockQueueAdd).toHaveBeenLastCalledWith(
+      "process-postback",
+      expect.objectContaining({ followRecheckAttempt: 1 }),
+      expect.objectContaining({ delay: 20_000 })
+    );
+
+    await getProcessor()(
+      createMockPostbackJob({ ...tap, followRecheck: true, followRecheckAttempt: 1 })
+    );
+    expect(mockQueueAdd).toHaveBeenLastCalledWith(
+      "process-postback",
+      expect.objectContaining({ followRecheckAttempt: 2 }),
+      expect.objectContaining({ delay: 40_000 })
+    );
+    // Neither pass has given up yet, so neither re-sends the prompt.
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+  });
+
+  it("treats a re-check queued before counting existed as the first one done", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+        followRecheck: true,
+      })
+    );
+
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ followRecheckAttempt: 2 }),
+      expect.anything()
+    );
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+  });
+
+  it("prompts a non-follower right away when the tap came from the opening DM", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789:open",
+      })
+    );
+
+    // Tapping the opening DM is not a claim to follow, so there is nothing to
+    // wait for: the follow prompt goes out now, not after the re-check delay.
+    expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      expect.any(String),
+      expect.any(String),
+      "followcheck:auto_789"
+    );
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    // Nor is it a rejection: they were never told to follow before this.
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("DM Worker — follow re-check acknowledgement", () => {
+  const gated = { ...mockAutomation, requireFollow: true, trackedLinks: [] };
+  const tap = {
+    instagramAccountId: "ig_456",
+    userId: "commenter_999",
+    payload: "followcheck:auto_789",
+  };
+  const mockRedisSet = vi.fn();
+
+  beforeEach(() => {
+    process.env.FOLLOW_RECHECK_ACK_MESSAGE = "Dame unos segundos que lo verifico";
+    mockRedisSet.mockReset().mockResolvedValue("OK");
+    vi.mocked(getRedisConnection).mockReturnValue({ set: mockRedisSet } as never);
+    mockPrisma.automation.findFirst.mockResolvedValue(gated);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+  });
+
+  afterEach(() => {
+    delete process.env.FOLLOW_RECHECK_ACK_MESSAGE;
+  });
+
+  it("answers a not-yet-visible follow right away instead of leaving the chat silent", async () => {
+    await getProcessor()(createMockPostbackJob(tap));
+
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Dame unos segundos que lo verifico"
+    );
+    // The re-check is still what decides; the acknowledgement only fills the wait.
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ followRecheckAttempt: 1 }),
+      expect.anything()
+    );
+  });
+
+  it("acknowledges a burst of taps only once", async () => {
+    mockRedisSet.mockResolvedValueOnce("OK").mockResolvedValueOnce(null);
+
+    await getProcessor()(createMockPostbackJob(tap));
+    await getProcessor()(createMockPostbackJob(tap));
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not acknowledge again on the re-check passes", async () => {
+    await getProcessor()(
+      createMockPostbackJob({ ...tap, followRecheck: true, followRecheckAttempt: 1 })
+    );
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+  });
+
+  it("still re-checks when the acknowledgement cannot be sent", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(new Error("boom"));
+
+    await expect(getProcessor()(createMockPostbackJob(tap))).resolves.toBeUndefined();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ followRecheckAttempt: 1 }),
+      expect.anything()
+    );
+  });
+
+  it("sends nothing extra when no acknowledgement message is configured", async () => {
+    delete process.env.FOLLOW_RECHECK_ACK_MESSAGE;
+
+    await getProcessor()(createMockPostbackJob(tap));
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockRedisSet).not.toHaveBeenCalled();
+  });
+});
+
+describe("ambiguous Meta sends and durable comment claims", () => {
+  const withLinks = { ...mockAutomation, trackedLinks: [{ slug: "resource", label: null, destinationUrl: "https://example.com" }] };
+
+  it("never falls back or retries Meta code 1, even though Meta may have sent the message", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([withLinks]);
+    mockSendPrivateReplyWithLinkButton.mockRejectedValue(new MetaApiError(1, undefined, undefined, "An unknown error has occurred."));
+    await expect(getProcessor()(createMockJob())).rejects.toMatchObject({ name: "UnrecoverableError" });
+    expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledTimes(1);
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", dmDeliveryUnconfirmed: true }) }));
+    expect(mockReleaseDMSlot).not.toHaveBeenCalled();
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+  });
+
+  it("retains the fallback's uncertain outcome instead of replacing it with the first rejection", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([withLinks]);
+    mockSendPrivateReplyWithLinkButton.mockRejectedValue(new MetaApiError(100, undefined, undefined, "Unsupported message template"));
+    mockSendPrivateReply.mockRejectedValue(new Error("Connection reset after send"));
+    await expect(getProcessor()(createMockJob())).rejects.toMatchObject({ name: "UnrecoverableError", message: expect.stringContaining("Connection reset after send") });
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ dmDeliveryUnconfirmed: true }) }));
+  });
+
+  it("blocks the historical code 1 failures before any further network send", async () => {
+    mockPrisma.dmLog.findUnique.mockResolvedValue({ status: "FAILED", attempts: 1, errorMessage: "MetaApiError 1: An unknown error has occurred.", dmDeliveryUnconfirmed: false });
+    await getProcessor()(createMockJob());
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(expect.objectContaining({ data: { dmDeliveryUnconfirmed: true } }));
+  });
+
+  it("cannot reset the lifetime attempt limit by enqueueing a new job", async () => {
+    mockPrisma.dmLog.findUnique.mockResolvedValue({ status: "FAILED", attempts: 3, dmDeliveryUnconfirmed: false });
+    await getProcessor()({ ...createMockJob(), id: "new-poll-job", attemptsMade: 0 });
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("allows only the claim winner to send when webhook and polling overlap", async () => {
+    let claimed = false;
+    mockPrisma.dmLog.updateMany.mockImplementation(async () => {
+      if (claimed) return { count: 0 };
+      claimed = true;
+      return { count: 1 };
+    });
+    const process = getProcessor();
+    await Promise.all([process(createMockJob()), process({ ...createMockJob(), id: "poll-job" })]);
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the pre-send claim when both success and failure log writes fail", async () => {
+    mockPrisma.dmLog.update.mockRejectedValue(new Error("Database unavailable"));
+    const process = getProcessor();
+    await expect(process(createMockJob())).rejects.toThrow("Database unavailable");
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ dmDeliveryUnconfirmed: true }) }));
+    mockPrisma.dmLog.findUnique.mockResolvedValue({ status: "PENDING", attempts: 1, dmDeliveryUnconfirmed: true });
+    await process({ ...createMockJob(), id: "retry-after-db-recovers" });
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+  });
+
+  it("does not send at all when storing the claim fails", async () => {
+    mockPrisma.dmLog.updateMany.mockRejectedValue(new Error("Database unavailable"));
+    await expect(getProcessor()(createMockJob())).rejects.toThrow("Database unavailable");
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+  });
+});
+
+it("deduplicates a redelivered Meta button tap after queue retention expires", async () => {
+  const claims = new Set<string>();
+  mockPrisma.postbackDelivery.create.mockImplementation(async ({ data }: { data: { id: string } }) => {
+    if (claims.has(data.id)) throw { code: "P2002" };
+    claims.add(data.id);
+    return data;
+  });
+  mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+  const data = { instagramAccountId: "ig_456", userId: "commenter_999", payload: "reveal:auto_789", mid: "same-meta-tap" };
+  const process = getProcessor();
+  await process(createMockPostbackJob(data));
+  await process({ ...createMockPostbackJob(data), id: "redelivered-after-eviction" });
+  expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+});
+
+it("retains the public reply claim if sending succeeded but its log write failed", async () => {
+  const { sendCommentReply } = await import("@/lib/meta/client");
+  vi.mocked(sendCommentReply).mockResolvedValue({ id: "public-reply" });
+  mockPrisma.automation.findMany.mockResolvedValue([{ ...mockAutomation, publicReplyEnabled: true, publicReplyMessages: ["Sent!"] }]);
+  mockPrisma.dmLog.update.mockRejectedValueOnce(new Error("Lost database connection after public send"));
+  const process = getProcessor();
+  await process(createMockJob());
+  expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ publicReplyDeliveryUnconfirmed: true }) }));
+  mockPrisma.dmLog.findUnique.mockResolvedValue({ status: "SENT", publicReplyDeliveryUnconfirmed: true });
+  await process({ ...createMockJob(), id: "next-poll" });
+  expect(sendCommentReply).toHaveBeenCalledTimes(1);
+  expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
 });

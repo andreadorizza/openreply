@@ -1,3 +1,10 @@
+import {
+  classifySendError,
+  hasLegacyUnconfirmedDelivery,
+  isConfirmedSendRejection,
+  isDeliveryUnconfirmed,
+} from "@/lib/instagram/delivery-errors";
+import { claimCommentDelivery, MAX_COMMENT_SEND_ATTEMPTS } from "./comment-delivery";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
@@ -18,6 +25,7 @@ import {
   RateLimitError,
   TokenExpiredError,
   getUserFollowStatus,
+  resolveRecipientName,
   sendCommentReply,
   sendDirectMessage,
   sendDirectMessageWithButton,
@@ -44,13 +52,54 @@ import {
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { hashRecipientId } from "@/lib/tracking/server";
 
-import {
-  ZernioApiError,
-  ZernioDeliveryUnconfirmedError,
-} from "@/lib/zernio/client";
+import { ZernioApiError } from "@/lib/zernio/client";
 
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
+
+// How long to wait before re-checking a follow that came back false: one
+// delay per re-check, each counted from the previous check.
+//
+// `is_user_follow_business` does not reflect a brand-new follow right away, and
+// the follow gate asks people to follow and tap a button that is sitting in
+// front of them — so tapping seconds after following is the normal case, not
+// the exception. Rejecting on the first `false` therefore turns away the exact
+// people who did what was asked, and they get told to follow an account they
+// already follow.
+//
+// Two checks rather than one long wait: measured, a follow still read `false`
+// 17 s after it happened and `true` by ~68 s. An early check catches the fast
+// ones sooner; the last still covers the slow ones.
+const FOLLOW_RECHECK_DELAYS_MS = (
+  process.env.FOLLOW_RECHECK_DELAYS_MS ?? "20000,40000"
+)
+  .split(",")
+  .map(Number)
+  .filter((ms) => ms > 0);
+const FOLLOW_RECHECK_TOTAL_MS = FOLLOW_RECHECK_DELAYS_MS.reduce(
+  (total, ms) => total + ms,
+  0
+);
+
+/**
+ * Sends Meta answered with an error but may well have delivered anyway.
+ *
+ * Meta returns the generic code 1 OAuthException on /messages *after* the DM
+ * has reached the recipient — observed in production: a user tapped the reply's
+ * button 30 seconds after a send this worker had already marked FAILED. Logging
+ * that as a plain failure is harmful twice over: the job is retried (up to
+ * BACKOFF_DELAYS.length times, each retry another copy in the same inbox), and
+ * the comment never satisfies the reconciler's "handled" test, so every sweep
+ * re-enqueues it for the whole lookback window. Together that sent one person
+ * dozens of identical DMs.
+ *
+ * Flagging it as unconfirmed instead is exactly what dmDeliveryUnconfirmed is
+ * for: the sweep's dedup already treats that as handled, and processComment
+ * skips a DM whose delivery is unconfirmed. The trade-off is deliberate — a
+ * code 1 that really did fail means that person gets no DM and can comment
+ * again, which is far better than spamming someone who already received it.
+ */
 
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
@@ -101,8 +150,10 @@ function isTemplateRejection(error: unknown): boolean {
   ) {
     return false;
   }
-  const message = error instanceof Error ? error.message : "";
-  return !NON_TEMPLATE_REJECTIONS.some((pattern) => pattern.test(message));
+  // Falling back is another send: allow it only for a proven template error.
+  return error instanceof MetaApiError && error.code === 100 &&
+    /template|button/i.test(error.message) &&
+    !NON_TEMPLATE_REJECTIONS.some((pattern) => pattern.test(error.message));
 }
 
 type WorkerTrackedLink = {
@@ -118,10 +169,11 @@ type WorkerTrackedLink = {
  */
 function buildLinkButtons(
   trackedLinks: WorkerTrackedLink[],
-  primaryLabel: string | null
+  primaryLabel: string | null,
+  recipientToken: string
 ): { title: string; url: string }[] {
   return trackedLinks.slice(0, 3).map((link, index) => ({
-    url: buildTrackedUrl(link.slug),
+    url: buildTrackedUrl(link.slug, undefined, recipientToken),
     title:
       (index === 0 ? primaryLabel : link.label) || link.label || "Open link",
   }));
@@ -136,14 +188,19 @@ function buildInlineLinkFallback(
   message: string,
   commenterName: string | null | undefined,
   trackedLinks: WorkerTrackedLink[],
-  bodyText: string
+  bodyText: string,
+  recipientToken: string
 ): string {
   const base =
-    renderMessageWithTracking({ message, commenterName, trackedLinks }) ||
-    bodyText;
+    renderMessageWithTracking({
+      message,
+      commenterName,
+      trackedLinks,
+      recipientToken,
+    }) || bodyText;
   const extraUrls = trackedLinks
     .slice(1)
-    .map((link) => buildTrackedUrl(link.slug));
+    .map((link) => buildTrackedUrl(link.slug, undefined, recipientToken));
   return extraUrls.length > 0 ? `${base}\n${extraUrls.join("\n")}` : base;
 }
 
@@ -192,9 +249,11 @@ async function sendRevealDirectMessage({
       message: automation.dmMessage,
       commenterName,
     }) || "Here's your link:";
+  const recipientToken = hashRecipientId(userId);
   const buttons = buildLinkButtons(
     automation.trackedLinks,
-    automation.linkButtonLabel
+    automation.linkButtonLabel,
+    recipientToken
   );
 
   try {
@@ -223,11 +282,12 @@ async function sendRevealDirectMessage({
           automation.dmMessage,
           commenterName,
           automation.trackedLinks,
-          bodyText
+          bodyText,
+          recipientToken
         ),
       });
-    } catch {
-      throw buttonError;
+    } catch (fallbackError) {
+      throw classifySendError(fallbackError);
     }
   }
 }
@@ -304,9 +364,18 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       },
     });
 
+    if (existingLog?.status === "FAILED" && hasLegacyUnconfirmedDelivery(existingLog.errorMessage)) {
+      await prisma.dmLog.update({
+        where: { automationId_commentId: { automationId: automation.id, commentId } },
+        data: { dmDeliveryUnconfirmed: true },
+      });
+      existingLog.dmDeliveryUnconfirmed = true;
+    }
+
     const alreadyDmd = existingLog?.status === "SENT";
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
-    const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed;
+    const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed &&
+      (existingLog?.attempts ?? 0) < MAX_COMMENT_SEND_ATTEMPTS;
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
     // already sent but whose public reply never posted (e.g. it hit a rate
@@ -381,37 +450,18 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       continue;
     }
 
-    // Ensure a log row exists before the public reply leg (which updates it).
-    // Only (re)set PENDING when the DM will actually be attempted, so a prior
-    // SENT is never clobbered while we come back just to retry the public reply.
-    if (!existingLog) {
-      await prisma.dmLog.create({
-        data: {
-          workspaceId: automation.workspaceId,
-          automationId: automation.id,
-          instagramAccountId: automation.instagramAccountId,
-          commenterId,
-          commenterName,
-          commentText,
-          commentId,
-          matchedKeyword: matchResult.matchedKeyword,
-          status: "PENDING",
-          attempts: job.attemptsMade + 1,
-        },
-      });
-    } else if (needsDm) {
-      await prisma.dmLog.update({
-        where: {
-          automationId_commentId: { automationId: automation.id, commentId },
-        },
-        data: {
-          status: "PENDING",
-          attempts: job.attemptsMade + 1,
-          matchedKeyword: matchResult.matchedKeyword,
-          errorMessage: null,
-        },
-      });
-    }
+    await prisma.dmLog.upsert({
+      where: { automationId_commentId: { automationId: automation.id, commentId } },
+      create: {
+        workspaceId: automation.workspaceId,
+        automationId: automation.id,
+        instagramAccountId: automation.instagramAccountId,
+        commenterId, commenterName, commentText, commentId,
+        matchedKeyword: matchResult.matchedKeyword,
+        status: "PENDING",
+      },
+      update: {},
+    });
 
     // Public reply leg — decoupled from the DM and posted first so a DM failure
     // (e.g. a non-follower whose messaging is restricted) never suppresses it.
@@ -426,7 +476,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       automation.publicReplyEnabled &&
       replyPool.length > 0 &&
       !existingLog?.publicReplySentAt &&
-      !existingLog?.publicReplyDeliveryUnconfirmed
+      !existingLog?.publicReplyDeliveryUnconfirmed &&
+      await claimCommentDelivery(automation.id, commentId, "public")
     ) {
       try {
         const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
@@ -445,7 +496,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           where: {
             automationId_commentId: { automationId: automation.id, commentId },
           },
-          data: { publicReplySentAt: new Date(), publicReplyError: null },
+          data: { publicReplySentAt: new Date(), publicReplyError: null, publicReplyDeliveryUnconfirmed: false },
         });
       } catch (error) {
         console.error(
@@ -460,7 +511,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
                 commentId,
               },
             },
-            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError },
+            data: { publicReplyError: formatError(classifySendError(error)), publicReplyDeliveryUnconfirmed: !isConfirmedSendRejection(error) },
           })
           .catch(() => {});
       }
@@ -534,9 +585,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         },
         data: {
           status: "FAILED",
-          attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
         },
       });
       throw error;
@@ -620,6 +669,20 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           : alreadyFollows !== true;
     }
 
+    let claimed;
+    try {
+      claimed = await claimCommentDelivery(automation.id, commentId, "dm");
+    } catch (error) {
+      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      throw error;
+    }
+    if (!claimed) {
+      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      continue;
+    }
+    let delivered = false;
     try {
       if (useOpeningDm) {
         const openingText = renderMessageWithTracking({
@@ -633,9 +696,9 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commentId: commentId,
           text: openingText,
           buttonTitle: automation.openingDmButtonLabel as string,
-          payload: automation.requireFollow
-            ? `followcheck:${automation.id}`
-            : `reveal:${automation.id}`,
+          // The ":open" marker tells a tap here apart from the follow prompt's
+          // own "I'm following" button, which sends the same prefix.
+          payload: `${automation.requireFollow ? "followcheck" : "reveal"}:${automation.id}:open`,
           postId: mediaId,
         });
       } else if (sendFollowPrompt) {
@@ -663,7 +726,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           }) || "Here's your link:";
         const buttons = buildLinkButtons(
           automation.trackedLinks,
-          automation.linkButtonLabel
+          automation.linkButtonLabel,
+          hashRecipientId(commenterId)
         );
 
         try {
@@ -689,7 +753,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             automation.dmMessage,
             commenterName,
             automation.trackedLinks,
-            bodyText
+            bodyText,
+            hashRecipientId(commenterId)
           );
           try {
             await sendPrivateReply({
@@ -699,11 +764,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
               message: fallbackMessage,
               postId: mediaId,
             });
-          } catch {
-            // The first attempt consumed the comment's single private reply, so
-            // this one reports "invalid for a private reply" no matter what the
-            // underlying problem was. Surface the original rejection instead.
-            throw buttonError;
+          } catch (fallbackError) {
+            throw classifySendError(fallbackError);
           }
         }
       } else {
@@ -711,6 +773,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           message: automation.dmMessage,
           commenterName,
           trackedLinks: automation.trackedLinks,
+          recipientToken: hashRecipientId(commenterId),
         });
         await sendPrivateReply({
           context: accessToken,
@@ -721,6 +784,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         });
       }
 
+      delivered = true;
       await prisma.dmLog.update({
         where: {
           automationId_commentId: {
@@ -731,36 +795,27 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         data: {
           status: "SENT",
           dmSentAt: new Date(),
+          dmDeliveryUnconfirmed: false,
           errorMessage: null,
         },
       });
     } catch (error) {
-      // The rate slot was reserved before the send; this send did not deliver a
-      // DM, so hand the slot back instead of burning it (and burning more on
-      // each BullMQ retry) until the hourly TTL expires.
-      if (rateLimit?.reserved) {
-        await releaseDMSlot(instagramAccountId);
+      const sendError = classifySendError(error);
+      // Retain reservations if the provider may have delivered the message.
+      if (isConfirmedSendRejection(sendError)) {
+        if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+        await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
       }
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart
-      );
-
       await prisma.dmLog.update({
-        where: {
-          automationId_commentId: {
-            automationId: automation.id,
-            commentId,
-          },
-        },
+        where: { automationId_commentId: { automationId: automation.id, commentId } },
         data: {
-          status: "FAILED",
-          attempts: job.attemptsMade + 1,
-          errorMessage: describeSendFailure(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          status: delivered ? "SENT" : "FAILED",
+          ...(delivered ? { dmSentAt: new Date() } : {}),
+          errorMessage: describeSendFailure(sendError),
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(sendError),
         },
       });
-      throw error;
+      throw sendError;
     }
   }
 }
@@ -769,13 +824,9 @@ async function sendPostbackOnce({
   operationId,
   send,
 }: {
-  operationId: string | null;
+  operationId: string;
   send: () => Promise<unknown>;
 }): Promise<boolean> {
-  if (!operationId) {
-    await send();
-    return true;
-  }
   try {
     await prisma.postbackDelivery.create({ data: { id: operationId } });
   } catch (error) {
@@ -794,17 +845,59 @@ async function sendPostbackOnce({
   } catch (error) {
     // A durable claim survives queue eviction, concurrent redelivery, and a
     // process crash during delivery. Only confirmed rejections permit retry.
-    if (
-      (error instanceof ZernioApiError && error.code < 500) ||
-      error instanceof RateLimitError ||
-      error instanceof TokenExpiredError
-    ) {
+    if (isConfirmedSendRejection(error)) {
       await prisma.postbackDelivery.delete({ where: { id: operationId } });
       throw error;
     }
-    throw error instanceof ZernioDeliveryUnconfirmedError
-      ? error
-      : new ZernioDeliveryUnconfirmedError();
+    throw classifySendError(error);
+  }
+}
+
+// Tells someone whose "I'm following" tap is being re-checked that it is being
+// looked at, so the chat does not sit silent while Instagram catches up with
+// the follow. Opt-in through FOLLOW_RECHECK_ACK_MESSAGE, and best-effort: it
+// never holds up the re-check, which is already queued when this runs.
+async function sendFollowRecheckAck({
+  context,
+  instagramAccountId,
+  automationId,
+  userId,
+  operationId,
+}: {
+  context: InstagramContext;
+  instagramAccountId: string;
+  automationId: string;
+  userId: string;
+  operationId: string | null;
+}): Promise<void> {
+  const message = process.env.FOLLOW_RECHECK_ACK_MESSAGE?.trim();
+  if (!message) return;
+  try {
+    // One acknowledgement per re-check cycle: a burst of taps collapses into a
+    // single re-check (bucketed job id) and should get a single reply too.
+    const first = await getRedisConnection().set(
+      `follow_recheck_ack:${automationId}:${userId}`,
+      "1",
+      "PX",
+      FOLLOW_RECHECK_TOTAL_MS,
+      "NX"
+    );
+    if (first !== "OK") return;
+    const send = () =>
+      sendDirectMessage({ context, instagramAccountId, userId, message });
+    // Its own id: the tap's id is claimed later by the link or prompt that
+    // the re-check sends, and claiming it here would suppress that message.
+    // Without an id the Redis NX above is the only dedupe.
+    if (operationId) {
+      await sendPostbackOnce({ operationId: `${operationId}:ack`, send });
+    } else {
+      await send();
+    }
+  } catch (error) {
+    console.log(
+      "[DM Worker] Failed to send follow re-check acknowledgement:",
+      formatError(error),
+    );
   }
 }
 
@@ -818,9 +911,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
 
   const isFollowCheck = payload.startsWith("followcheck:");
   if (!isFollowCheck && !payload.startsWith("reveal:")) return;
-  const automationId = payload.slice(
-    isFollowCheck ? "followcheck:".length : "reveal:".length,
-  );
+  // The opening DM's button appends ":open" to the payload; the follow
+  // prompt's button does not. Automation ids are cuids and contain no colon.
+  const [automationId, marker] = payload
+    .slice(isFollowCheck ? "followcheck:".length : "reveal:".length)
+    .split(":");
+  const fromOpeningDm = marker === "open";
 
   const automation = await prisma.automation.findFirst({
     where: { id: automationId, isActive: true, ...connectionScope(job.data) },
@@ -862,13 +958,6 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       return;
   }
 
-  // Personalize {username} from the opening DM log for this user, if present.
-  const openingLog = await prisma.dmLog.findFirst({
-    where: { automationId: automation.id, commenterId: userId },
-    select: { commenterName: true },
-  });
-  const commenterName = openingLog?.commenterName ?? null;
-
   let accessToken: InstagramContext;
   try {
     accessToken = await createInstagramContext(
@@ -879,33 +968,109 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     return;
   }
 
-  const operationId =
-    accessToken.provider === "ZERNIO"
-      ? createHash("sha256")
-          .update(
-            JSON.stringify([
-              automation.instagramAccountId,
-              automation.id,
-              userId,
-              job.data.mid ?? job.id ?? payload,
-            ]),
-          )
-          .digest("hex")
-      : null;
+  // Personalize {username}. The postback carries only the tapper's IGSID.
+  const commenterName = await resolveRecipientName({
+    context: accessToken,
+    workspaceId: automation.workspaceId,
+    recipientId: userId,
+  });
+
+  const operationId = createHash("sha256")
+    .update(JSON.stringify([
+      automation.instagramAccountId,
+      automation.id,
+      userId,
+      job.data.mid ?? job.id ?? payload,
+    ]))
+    .digest("hex");
 
   // Follow-gate: before revealing the link, verify the user follows. On a
   // `followcheck:` tap a non-follower gets the prompt again (no quota spent);
   // on a read fallback a non-follower is silently skipped — the gate must not
-  // be bypassable by just reading the DM and waiting. Following, or
-  // unverifiable (null), falls through and delivers the link — fail-open so a
+  // be bypassable by just reading the DM and waiting. On a tap, following or
+  // unverifiable (null) falls through and delivers the link — fail-open so a
   // real follower is never trapped.
   if ((isFollowCheck || fallback) && automation.requireFollow) {
     const follows = await getUserFollowStatus({
       context: accessToken,
       recipientId: userId,
     });
+    // A read fallback needs a confirmed follow. Instagram only reports follow
+    // status once the person has tapped a button (before that it answers
+    // "User consent is required", i.e. null), so failing open here handed the
+    // link to anyone who read the opening DM and waited, follower or not.
+    if (fallback && follows !== true) return;
     if (follows === false) {
       if (fallback) return;
+
+      // A tap on an opening-DM button is not a claim to follow — most people
+      // who tap it simply don't follow yet — so they get the follow prompt
+      // right away. Only the prompt's own button earns the delayed re-check;
+      // holding an opening tap for it left people staring at a silent chat.
+      if (!fromOpeningDm) {
+        // A `false` on a button tap: give the follow time to register and look
+        // again, rather than rejecting someone who just followed.
+        //
+        // The job id is bucketed by the recheck window, not fixed per user.
+        // BullMQ keeps completed jobs (removeOnComplete: count 1000) and silently
+        // drops an add whose id is still retained, so a fixed id let a person be
+        // re-checked once and then never again — their next false tap did
+        // nothing at all, no link and no prompt. Bucketing still collapses a burst
+        // of taps into a single re-check, which is what the fixed id was for.
+        //
+        // Jobs queued before re-checks were counted carry only `followRecheck`,
+        // which meant one re-check done.
+        const rechecksDone =
+          job.data.followRecheckAttempt ?? (job.data.followRecheck ? 1 : 0);
+        if (rechecksDone < FOLLOW_RECHECK_DELAYS_MS.length) {
+          const delay = FOLLOW_RECHECK_DELAYS_MS[rechecksDone];
+          const window = Math.floor(Date.now() / delay);
+          await getDMQueue().add(
+            POSTBACK_JOB_NAME,
+            {
+              ...job.data,
+              followRecheck: true,
+              followRecheckAttempt: rechecksDone + 1,
+            },
+            {
+              delay,
+              jobId: `postback_recheck_${automation.id}_${userId}_${rechecksDone + 1}_${window}`,
+            }
+          );
+          if (rechecksDone === 0) {
+            await sendFollowRecheckAck({
+              context: accessToken,
+              instagramAccountId: automation.instagramAccount.instagramId,
+              automationId: automation.id,
+              userId,
+              operationId,
+            });
+          }
+          return;
+        }
+
+        // Last `false`: they are genuinely not following. Record it — this
+        // branch used to return without writing anything at all, so a gate that
+        // turned people away left no trace and its rejection rate could not be
+        // measured, only guessed at from complaints.
+        await prisma.operationalEvent
+          .create({
+            data: {
+              workspaceId: automation.workspaceId,
+              source: "WORKER",
+              level: "INFO",
+              message: "Follow gate rejected a button tap",
+              payload: {
+                automationId: automation.id,
+                automationName: automation.name,
+                userId,
+                commenterName,
+              },
+            },
+          })
+          .catch(() => {});
+      }
+
       const promptText = renderMessageWithoutLink({
         message:
           automation.followPromptMessage ||
@@ -1022,8 +1187,9 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       },
       update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
     });
-  } catch (error) {
-    await releaseWorkspaceDMReservation(
+  } catch (originalError) {
+    const error = classifySendError(originalError);
+    if (isConfirmedSendRejection(error)) await releaseWorkspaceDMReservation(
       automation.workspaceId,
       usage.periodStart,
     );
@@ -1035,7 +1201,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // failure the user can act on — so don't log it as FAILED and don't retry
     // it against a window that cannot reopen on its own. It still delivers in
     // the case that does work: the user replied by typing instead of tapping.
-    if (fallback && !(error instanceof ZernioDeliveryUnconfirmedError)) {
+    if (fallback && !isDeliveryUnconfirmed(error)) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",
         formatError(error),
@@ -1060,12 +1226,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commentId: dedupeId,
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
       update: {
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
     });
     throw error;
@@ -1242,13 +1408,13 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       continue;
     }
 
-    // Reuse a name captured on an earlier interaction so {username} still
-    // renders — the messages webhook carries only the sender's IGSID.
-    const priorLog = await prisma.dmLog.findFirst({
-      where: { automationId: automation.id, commenterId: senderId },
-      select: { commenterName: true },
+    // Personalize {username}. The messages webhook carries only the sender's
+    // IGSID, so the handle is recovered from an earlier send or read live.
+    const commenterName = await resolveRecipientName({
+      context: accessToken,
+      workspaceId: automation.workspaceId,
+      recipientId: senderId,
     });
-    const commenterName = priorLog?.commenterName ?? null;
 
     // Follow gate: anyone not confirmed as a follower gets the prompt instead of
     // the link, with the same `followcheck:` button that re-verifies on tap.
@@ -1374,13 +1540,13 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
         update: {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -1405,10 +1571,11 @@ async function processJob(job: Job<DmQueueJob>): Promise<void> {
   try {
     await dispatchJob(job);
   } catch (error) {
-    if (error instanceof ZernioDeliveryUnconfirmedError)
-      throw new UnrecoverableError(error.message);
-    if (isPermanentRejection(error))
-      throw new UnrecoverableError((error as Error).message);
+    // formatError() takes unknown; isDeliveryUnconfirmed() is a type guard on
+    // Error subclasses, but keep using formatError() for a consistent message
+    // format across every UnrecoverableError thrown from this worker.
+    if (isDeliveryUnconfirmed(error) || isPermanentRejection(error))
+      throw new UnrecoverableError(formatError(error));
     throw error;
   }
 }
