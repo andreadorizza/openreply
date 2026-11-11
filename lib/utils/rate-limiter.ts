@@ -20,6 +20,13 @@ const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented c
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
 const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_REQUEUE_ATTEMPTS = 3;
+// How long an account stops sending after Meta itself refuses a send as rate
+// limited. Meta gives no retry-after, and a throttled account that keeps
+// sending stays throttled: on a busy post every queued comment then fails in
+// turn instead of waiting for the window to clear.
+const META_PAUSE_MS = 15 * 60 * 1000;
+// Jobs held by a pause resume spread over this window, not all at once.
+const META_PAUSE_JITTER_MS = 2 * 60 * 1000;
 
 let redis: Redis | null = null;
 
@@ -47,6 +54,11 @@ local current = tonumber(redis.call("GET", KEYS[1]) or "0")
 local max = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 
+local paused_ms = tonumber(redis.call("PTTL", KEYS[2]))
+if paused_ms > 0 then
+  return {0, current, 0, paused_ms}
+end
+
 if current >= max then
   return {0, current, 0}
 end
@@ -67,7 +79,8 @@ function toScriptNumber(value: unknown): number {
 
 function blockedResult(
   count: number,
-  requeueAttempt: number
+  requeueAttempt: number,
+  requeueDelayMs: number = REQUEUE_DELAY_MS
 ): RateLimitResult {
   if (requeueAttempt >= MAX_REQUEUE_ATTEMPTS) {
     return {
@@ -86,10 +99,28 @@ function blockedResult(
     currentCount: count,
     remainingDMs: 0,
     shouldRequeue: true,
-    requeueDelayMs: REQUEUE_DELAY_MS,
+    requeueDelayMs,
     shouldSkip: false,
     reserved: false,
   };
+}
+
+function pauseKey(instagramAccountId: string): string {
+  return `rate:dm:pause:${instagramAccountId}`;
+}
+
+/**
+ * Stop sending from an account for a while because Meta rate limited it.
+ *
+ * Every reserveDMSlot call for the account is refused until the pause ends,
+ * and the job is requeued for when it does, so nothing reaches Meta in the
+ * meantime. A later refusal extends the pause from that moment.
+ */
+export async function pauseDMSends(
+  instagramAccountId: string,
+  pauseMs: number = META_PAUSE_MS
+): Promise<void> {
+  await getRedis().set(pauseKey(instagramAccountId), "1", "PX", pauseMs);
 }
 
 /**
@@ -163,8 +194,9 @@ export async function reserveDMSlot(
 
   const result = await client.eval(
     RESERVE_DM_SLOT_SCRIPT,
-    1,
+    2,
     key,
+    pauseKey(instagramAccountId),
     RATE_LIMIT_MAX,
     RATE_LIMIT_WINDOW
   );
@@ -172,9 +204,16 @@ export async function reserveDMSlot(
   const allowedFlag = toScriptNumber(values[0]);
   const count = toScriptNumber(values[1]);
   const remaining = toScriptNumber(values[2]);
+  const pausedMs = toScriptNumber(values[3]);
 
   if (allowedFlag !== 1) {
-    return blockedResult(count, requeueAttempt);
+    return pausedMs > 0
+      ? blockedResult(
+          count,
+          requeueAttempt,
+          pausedMs + Math.floor(Math.random() * META_PAUSE_JITTER_MS)
+        )
+      : blockedResult(count, requeueAttempt);
   }
 
   return {
@@ -251,4 +290,11 @@ export async function resetRateLimit(
 }
 
 // Export constants for use in tests
-export { RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, REQUEUE_DELAY_MS, MAX_REQUEUE_ATTEMPTS };
+export {
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW,
+  REQUEUE_DELAY_MS,
+  MAX_REQUEUE_ATTEMPTS,
+  META_PAUSE_MS,
+  META_PAUSE_JITTER_MS,
+};

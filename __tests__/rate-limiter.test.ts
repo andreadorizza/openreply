@@ -7,11 +7,12 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockGet, mockEval, mockDel, mockDecr } = vi.hoisted(() => ({
+const { mockGet, mockEval, mockDel, mockDecr, mockSet } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockEval: vi.fn(),
   mockDel: vi.fn(),
   mockDecr: vi.fn(),
+  mockSet: vi.fn(),
 }));
 
 vi.mock("ioredis", () => {
@@ -22,6 +23,7 @@ vi.mock("ioredis", () => {
     this.eval = mockEval;
     this.del = mockDel;
     this.decr = mockDecr;
+    this.set = mockSet;
     return this;
   });
   return { default: MockRedis };
@@ -34,7 +36,11 @@ import {
   incrementDMCounter,
   reserveDMSlot,
   releaseDMSlot,
+  pauseDMSends,
   RATE_LIMIT_MAX,
+  REQUEUE_DELAY_MS,
+  META_PAUSE_MS,
+  META_PAUSE_JITTER_MS,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -94,8 +100,9 @@ describe("reserveDMSlot", () => {
 
     expect(mockEval).toHaveBeenCalledWith(
       expect.any(String),
-      1,
+      2,
       "rate:dm:account_123",
+      "rate:dm:pause:account_123",
       RATE_LIMIT_MAX,
       3600
     );
@@ -114,6 +121,19 @@ describe("reserveDMSlot", () => {
     expect(result.reserved).toBe(false);
     expect(result.shouldRequeue).toBe(true);
     expect(result.shouldSkip).toBe(false);
+    expect(result.requeueDelayMs).toBe(REQUEUE_DELAY_MS);
+  });
+
+  it("should hold sends while the account is paused, until the pause ends", async () => {
+    mockEval.mockResolvedValue([0, 12, 0, 240_000]);
+
+    const result = await reserveDMSlot("account_123", 0);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reserved).toBe(false);
+    expect(result.shouldRequeue).toBe(true);
+    expect(result.requeueDelayMs).toBeGreaterThanOrEqual(240_000);
+    expect(result.requeueDelayMs).toBeLessThan(240_000 + META_PAUSE_JITTER_MS);
   });
 
   it("should skip after max requeue attempts", async () => {
@@ -155,5 +175,20 @@ describe("releaseDMSlot", () => {
 
     expect(count).toBe(0);
     expect(mockDel).toHaveBeenCalledWith("rate:dm:account_123");
+  });
+});
+
+describe("pauseDMSends", () => {
+  it("sets an expiring pause key for the account", async () => {
+    mockSet.mockResolvedValue("OK");
+
+    await pauseDMSends("account_123");
+
+    expect(mockSet).toHaveBeenCalledWith(
+      "rate:dm:pause:account_123",
+      "1",
+      "PX",
+      META_PAUSE_MS
+    );
   });
 });
