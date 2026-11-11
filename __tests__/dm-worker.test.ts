@@ -14,6 +14,8 @@ const {
   mockReserveDMSlot,
   mockReleaseDMSlot,
   mockPauseDMSends,
+  mockRecordThreadRefusal,
+  mockClearAccountBlock,
   mockQueueAdd,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
@@ -52,6 +54,8 @@ const {
   mockReserveDMSlot: vi.fn(),
   mockReleaseDMSlot: vi.fn(),
   mockPauseDMSends: vi.fn(),
+  mockRecordThreadRefusal: vi.fn(),
+  mockClearAccountBlock: vi.fn(),
   mockQueueAdd: vi.fn(),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
@@ -103,6 +107,9 @@ vi.mock("@/lib/utils/rate-limiter", () => ({
   reserveDMSlot: mockReserveDMSlot,
   releaseDMSlot: mockReleaseDMSlot,
   pauseDMSends: mockPauseDMSends,
+  recordThreadRefusal: mockRecordThreadRefusal,
+  clearAccountBlock: mockClearAccountBlock,
+  ACCOUNT_BLOCK_PAUSE_MS: 1_800_000,
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -267,6 +274,8 @@ beforeEach(() => {
   });
   mockReleaseDMSlot.mockResolvedValue(0);
   mockPauseDMSends.mockResolvedValue(undefined);
+  mockRecordThreadRefusal.mockResolvedValue(false);
+  mockClearAccountBlock.mockResolvedValue(undefined);
   mockReleaseWorkspaceDMReservation.mockResolvedValue({ count: 1 });
   mockSendPrivateReply.mockResolvedValue({
     recipient_id: "commenter_999",
@@ -359,7 +368,7 @@ describe("DM Worker — Full Pipeline", () => {
       true
     );
     expect(mockReserveWorkspaceDMSend).toHaveBeenCalledWith("workspace_123");
-    expect(mockReserveDMSlot).toHaveBeenCalledWith("ig_456", 0);
+    expect(mockReserveDMSlot).toHaveBeenCalledWith("ig_456", 0, undefined);
     // A successful send keeps its slot; the release path is failure-only.
     expect(mockReleaseDMSlot).not.toHaveBeenCalled();
     expect(mockDecryptToken).toHaveBeenCalledWith("encrypted_token_abc");
@@ -1006,6 +1015,8 @@ describe("DM Worker — one private reply per comment", () => {
         data: expect.objectContaining({ status: "FAILED", attempts: 3 }),
       })
     );
+    // Counted, in case it turns out to be part of an account-wide block.
+    expect(mockRecordThreadRefusal).toHaveBeenCalledWith("ig_456", "commenter_999");
     expect(mockPauseDMSends).not.toHaveBeenCalled();
   });
 
@@ -1088,6 +1099,145 @@ describe("DM Worker — one private reply per comment", () => {
         data: expect.objectContaining({ status: "SENT" }),
       })
     );
+  });
+});
+
+describe("DM Worker — Instagram blocking the whole account", () => {
+  const threadRefusal = () =>
+    new MetaApiError(
+      100,
+      2534001,
+      undefined,
+      "The thread owner has archived or deleted this conversation, or the thread does not exist."
+    );
+  const heldAfterPause = {
+    allowed: false,
+    currentCount: 11,
+    remainingDMs: 0,
+    shouldRequeue: true,
+    requeueDelayMs: 1_800_000,
+    shouldSkip: false,
+    reserved: false,
+  };
+
+  it("holds a refused comment for after the block instead of dropping it", async () => {
+    mockSendPrivateReply.mockRejectedValue(threadRefusal());
+    mockRecordThreadRefusal.mockResolvedValue(true);
+    mockReserveDMSlot
+      .mockResolvedValueOnce({
+        allowed: true,
+        currentCount: 11,
+        remainingDMs: 179,
+        shouldRequeue: false,
+        requeueDelayMs: 0,
+        shouldSkip: false,
+        reserved: true,
+      })
+      .mockResolvedValueOnce(heldAfterPause);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockPauseDMSends).toHaveBeenCalledWith("ig_456", 1_800_000);
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "PENDING",
+          errorMessage: expect.stringContaining("account-wide block"),
+          // The claim marked it unconfirmed; a refusal proves nothing was sent.
+          dmDeliveryUnconfirmed: false,
+        }),
+      })
+    );
+    for (const [args] of mockPrisma.dmLog.update.mock.calls) {
+      expect(args.data).not.toHaveProperty("attempts");
+    }
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-comment",
+      expect.objectContaining({ commentId: "comment_555", requeueAttempt: 1 }),
+      expect.objectContaining({ delay: 1_800_000 })
+    );
+  });
+
+  it("still fails a comment refused on its last try, even during a block", async () => {
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      id: "existing_log",
+      status: "FAILED",
+      attempts: 2,
+      dmDeliveryUnconfirmed: false,
+      publicReplySentAt: null,
+      publicReplyDeliveryUnconfirmed: false,
+      errorMessage: "earlier refusal",
+    });
+    mockSendPrivateReply.mockRejectedValue(threadRefusal());
+    mockRecordThreadRefusal.mockResolvedValue(true);
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+
+    // A genuinely closed thread must not keep the account paused for ever.
+    expect(mockPauseDMSends).toHaveBeenCalledWith("ig_456", 1_800_000);
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED", attempts: 3 }),
+      })
+    );
+  });
+
+  it("forgets a remembered block once a DM is delivered", async () => {
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockClearAccountBlock).toHaveBeenCalledWith("ig_456");
+  });
+});
+
+describe("DM Worker — paced comment DMs", () => {
+  it("queues a comment for its send slot", async () => {
+    mockReserveDMSlot.mockResolvedValue({
+      allowed: false,
+      currentCount: 11,
+      remainingDMs: 0,
+      shouldRequeue: true,
+      requeueDelayMs: 40_000,
+      shouldSkip: false,
+      reserved: false,
+      slotAt: 1_800_000_040_000,
+    });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "PENDING",
+          errorMessage: expect.stringContaining("paced"),
+        }),
+      })
+    );
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-comment",
+      expect.objectContaining({ requeueAttempt: 1, slotAt: 1_800_000_040_000 }),
+      expect.objectContaining({
+        delay: 40_000,
+        jobId: "comment_ig_456_comment_555_slot_1800000040000",
+      })
+    );
+  });
+
+  it("hands a job's slot back to the limiter when it returns", async () => {
+    const processor = getProcessor();
+    await processor(
+      createMockJob({ ...mockJobData, requeueAttempt: 1, slotAt: 1_800_000_040_000 })
+    );
+
+    expect(mockReserveDMSlot).toHaveBeenCalledWith("ig_456", 1, 1_800_000_040_000);
+    expect(mockSendPrivateReply).toHaveBeenCalled();
   });
 });
 

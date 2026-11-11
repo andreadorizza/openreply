@@ -41,9 +41,13 @@ import {
 } from "@/lib/instagram/provider";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import {
+  ACCOUNT_BLOCK_PAUSE_MS,
+  clearAccountBlock,
   pauseDMSends,
+  recordThreadRefusal,
   reserveDMSlot,
   releaseDMSlot,
+  type RateLimitResult,
 } from "@/lib/utils/rate-limiter";
 import {
   releaseWorkspaceDMReservation,
@@ -125,9 +129,24 @@ const NON_TEMPLATE_REJECTIONS = [
   /invalid for a private reply/i,
   /requested user cannot be found/i,
   // sub=2534001. Observed failing identically on all three retries, minutes
-  // apart, for every affected comment.
+  // apart, for every affected comment. Final for one commenter; a burst of them
+  // is an account-wide block instead, see isThreadRefusal.
   /thread owner has archived or deleted this conversation/i,
 ];
+
+// Instagram gives the same answer when one commenter has closed their DMs and
+// when it refuses every new conversation from the account (twice for hours on a
+// viral reel, at about 150 private replies an hour). recordThreadRefusal tells
+// the two apart by counting refusals across commenters.
+function isThreadRefusal(error: unknown): boolean {
+  return (
+    error instanceof MetaApiError &&
+    /thread owner has archived or deleted this conversation/i.test(error.message)
+  );
+}
+
+const ACCOUNT_BLOCK_HOLD_MESSAGE =
+  "Instagram is refusing new conversations from this account (an account-wide block, not this commenter); DM held until it lifts";
 
 // Every pattern above is a verdict on the comment or conversation, so the job
 // retries (5, 15, 45 minutes later) fail identically: three alerts for one
@@ -302,6 +321,61 @@ async function sendRevealDirectMessage({
 
 function connectionScope(data: DmQueueJob) {
   return data.accountConnectionId ? { instagramAccountId: data.accountConnectionId } : {};
+}
+
+// A comment the rate limiter will not send now: queue it again for when it may,
+// or log it as skipped once it has been held too often.
+async function holdComment(
+  job: Job<ProcessCommentJob>,
+  automationId: string,
+  matchedKeyword: string | null,
+  rateLimit: RateLimitResult,
+  heldMessage?: string
+): Promise<void> {
+  const { instagramAccountId, commentId } = job.data;
+  const where = { automationId_commentId: { automationId, commentId } };
+
+  if (rateLimit.shouldSkip) {
+    await prisma.dmLog.update({
+      where,
+      data: {
+        status: "SKIPPED_RATE_LIMIT",
+        matchedKeyword,
+        errorMessage:
+          "Instagram DM rate limit reached (hourly cap, or Instagram throttling the account)",
+        dmDeliveryUnconfirmed: false,
+      },
+    });
+    return;
+  }
+
+  await prisma.dmLog.update({
+    where,
+    data: {
+      status: "PENDING",
+      matchedKeyword,
+      errorMessage:
+        heldMessage ??
+        (rateLimit.slotAt
+          ? "Waiting for its send slot (comment DMs are paced); retry scheduled"
+          : "Rate limited (hourly cap, or Instagram throttling the account); retry scheduled"),
+      dmDeliveryUnconfirmed: false,
+    },
+  });
+
+  const requeueAttempt = (job.data.requeueAttempt ?? 0) + 1;
+  await getDMQueue().add(
+    "process-comment",
+    { ...job.data, requeueAttempt, slotAt: rateLimit.slotAt },
+    {
+      delay: rateLimit.requeueDelayMs,
+      // One id per slot for a paced hold: a fixed id could match a job kept from
+      // an earlier hold of the same comment, and BullMQ would drop the add.
+      jobId: rateLimit.slotAt
+        ? `comment_${instagramAccountId}_${commentId}_slot_${rateLimit.slotAt}`
+        : `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt}`,
+    }
+  );
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
@@ -577,7 +651,11 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     let rateLimit;
     try {
-      rateLimit = await reserveDMSlot(instagramAccountId, requeueAttempt);
+      rateLimit = await reserveDMSlot(
+        instagramAccountId,
+        requeueAttempt,
+        job.data.slotAt
+      );
     } catch (error) {
       await releaseWorkspaceDMReservation(
         automation.workspaceId,
@@ -603,54 +681,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         automation.workspaceId,
         usage.periodStart
       );
-
-      if (rateLimit.shouldSkip) {
-        await prisma.dmLog.update({
-          where: {
-            automationId_commentId: {
-              automationId: automation.id,
-              commentId,
-            },
-          },
-          data: {
-            status: "SKIPPED_RATE_LIMIT",
-            matchedKeyword: matchResult.matchedKeyword,
-            errorMessage:
-              "Instagram DM rate limit reached (hourly cap, or Instagram throttling the account)",
-          },
-        });
-        continue;
-      }
-
-      if (rateLimit.shouldRequeue) {
-        await prisma.dmLog.update({
-          where: {
-            automationId_commentId: {
-              automationId: automation.id,
-              commentId,
-            },
-          },
-          data: {
-            status: "PENDING",
-            matchedKeyword: matchResult.matchedKeyword,
-            errorMessage:
-              "Rate limited (hourly cap, or Instagram throttling the account); retry scheduled",
-          },
-        });
-
-        await getDMQueue().add(
-          "process-comment",
-          {
-            ...job.data,
-            requeueAttempt: requeueAttempt + 1,
-          },
-          {
-            delay: rateLimit.requeueDelayMs,
-            jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
-          }
-        );
-        continue;
-      }
+      await holdComment(job, automation.id, matchResult.matchedKeyword, rateLimit);
+      continue;
     }
 
     // With an opening DM, the private reply is a button message; tapping it
@@ -808,6 +840,13 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: null,
         },
       });
+      // Instagram accepted a private reply, so any remembered block is over.
+      await clearAccountBlock(instagramAccountId).catch((clearError) =>
+        console.error(
+          "[DM Worker] Failed to clear the account block:",
+          formatError(clearError)
+        )
+      );
     } catch (error) {
       const sendError = classifySendError(error);
       // Retain reservations if the provider may have delivered the message.
@@ -825,6 +864,68 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             formatError(pauseError)
           )
         );
+      }
+      // Instagram refusing every new conversation from the account: pause it,
+      // and hold this comment for when the block lifts instead of dropping it.
+      // A comment refused on every try is still final, so one genuinely closed
+      // thread cannot keep the account paused.
+      const accountBlocked =
+        !delivered &&
+        isThreadRefusal(sendError) &&
+        (await recordThreadRefusal(instagramAccountId, commenterId).catch(
+          (recordError) => {
+            console.error(
+              "[DM Worker] Failed to record a thread refusal:",
+              formatError(recordError)
+            );
+            return false;
+          }
+        ));
+      if (accountBlocked) {
+        await pauseDMSends(instagramAccountId, ACCOUNT_BLOCK_PAUSE_MS).catch(
+          (pauseError) =>
+            console.error(
+              "[DM Worker] Failed to pause sends for an account block:",
+              formatError(pauseError)
+            )
+        );
+      }
+      if (
+        accountBlocked &&
+        (existingLog?.attempts ?? 0) + 1 < MAX_COMMENT_SEND_ATTEMPTS
+      ) {
+        try {
+          // Taken during the pause, so the slot is after it (and spaced out
+          // from the other held comments when pacing is on).
+          let hold = await reserveDMSlot(instagramAccountId, requeueAttempt);
+          if (hold.allowed) {
+            // The pause did not take; hold for its length anyway.
+            if (hold.reserved) await releaseDMSlot(instagramAccountId);
+            hold = {
+              ...hold,
+              allowed: false,
+              reserved: false,
+              shouldRequeue: true,
+              requeueDelayMs: ACCOUNT_BLOCK_PAUSE_MS,
+            };
+          }
+          await holdComment(
+            job,
+            automation.id,
+            matchResult.matchedKeyword,
+            hold,
+            ACCOUNT_BLOCK_HOLD_MESSAGE
+          );
+          console.warn(
+            `[DM Worker] Instagram is refusing new conversations from ${instagramAccountId}: comment DMs paused, comment ${commentId} held for ${Math.round(hold.requeueDelayMs / 60_000)} min`
+          );
+          continue;
+        } catch (holdError) {
+          console.error(
+            "[DM Worker] Failed to hold a comment during an account block:",
+            formatError(holdError)
+          );
+        }
       }
       await prisma.dmLog.update({
         where: { automationId_commentId: { automationId: automation.id, commentId } },

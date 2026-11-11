@@ -5,7 +5,7 @@
  * Assertions derive from RATE_LIMIT_MAX so they survive a change to the cap.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const { mockGet, mockEval, mockDel, mockDecr, mockSet } = vi.hoisted(() => ({
   mockGet: vi.fn(),
@@ -37,10 +37,18 @@ import {
   reserveDMSlot,
   releaseDMSlot,
   pauseDMSends,
+  recordThreadRefusal,
+  clearAccountBlock,
+  commentDmIntervalMs,
   RATE_LIMIT_MAX,
   REQUEUE_DELAY_MS,
   META_PAUSE_MS,
   META_PAUSE_JITTER_MS,
+  MAX_PACED_REQUEUE_ATTEMPTS,
+  MAX_PACED_HOLD_MS,
+  THREAD_REFUSAL_WINDOW_MS,
+  THREAD_REFUSAL_BURST,
+  ACCOUNT_BLOCK_MEMORY_MS,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -100,11 +108,18 @@ describe("reserveDMSlot", () => {
 
     expect(mockEval).toHaveBeenCalledWith(
       expect.any(String),
-      2,
+      3,
       "rate:dm:account_123",
       "rate:dm:pause:account_123",
+      "rate:dm:next:account_123",
       RATE_LIMIT_MAX,
-      3600
+      3600,
+      0, // pacing off unless COMMENT_DM_MAX_PER_HOUR is set
+      0,
+      expect.any(Number),
+      MAX_PACED_HOLD_MS,
+      expect.any(Number),
+      expect.any(Number)
     );
     expect(result.allowed).toBe(true);
     expect(result.reserved).toBe(true);
@@ -179,16 +194,124 @@ describe("releaseDMSlot", () => {
 });
 
 describe("pauseDMSends", () => {
-  it("sets an expiring pause key for the account", async () => {
-    mockSet.mockResolvedValue("OK");
+  it("pauses the account, never shortening a pause already running", async () => {
+    mockEval.mockResolvedValue(1);
 
     await pauseDMSends("account_123");
 
-    expect(mockSet).toHaveBeenCalledWith(
+    expect(mockEval).toHaveBeenCalledWith(
+      expect.stringContaining("PTTL"),
+      1,
       "rate:dm:pause:account_123",
-      "1",
-      "PX",
       META_PAUSE_MS
+    );
+  });
+});
+
+describe("commentDmIntervalMs", () => {
+  afterEach(() => {
+    delete process.env.COMMENT_DM_MAX_PER_HOUR;
+  });
+
+  it("is off when COMMENT_DM_MAX_PER_HOUR is unset or invalid", () => {
+    expect(commentDmIntervalMs()).toBe(0);
+    process.env.COMMENT_DM_MAX_PER_HOUR = "lots";
+    expect(commentDmIntervalMs()).toBe(0);
+    process.env.COMMENT_DM_MAX_PER_HOUR = "0";
+    expect(commentDmIntervalMs()).toBe(0);
+  });
+
+  it("spaces sends evenly across the hour", () => {
+    process.env.COMMENT_DM_MAX_PER_HOUR = "90";
+    expect(commentDmIntervalMs()).toBe(40_000);
+  });
+
+  it("never paces looser than the hourly cap", () => {
+    process.env.COMMENT_DM_MAX_PER_HOUR = String(RATE_LIMIT_MAX * 10);
+    expect(commentDmIntervalMs()).toBe(Math.ceil(3_600_000 / RATE_LIMIT_MAX));
+  });
+});
+
+describe("reserveDMSlot with pacing", () => {
+  afterEach(() => {
+    delete process.env.COMMENT_DM_MAX_PER_HOUR;
+  });
+
+  it("passes the interval and the job's slot to the script", async () => {
+    process.env.COMMENT_DM_MAX_PER_HOUR = "90";
+    mockEval.mockResolvedValue([1, 5, RATE_LIMIT_MAX - 5]);
+
+    const result = await reserveDMSlot("account_123", 1, 1_800_000_040_000);
+
+    expect(result.allowed).toBe(true);
+    const args = mockEval.mock.calls[0];
+    expect(args[6]).toBe(3600);
+    expect(args[7]).toBe(40_000);
+    expect(args[8]).toBe(1_800_000_040_000);
+  });
+
+  it("holds a comment for its slot and returns the slot", async () => {
+    mockEval.mockResolvedValue([0, 5, 0, 0, 40_000, 1_800_000_040_000]);
+
+    const result = await reserveDMSlot("account_123", 0);
+
+    expect(result.allowed).toBe(false);
+    expect(result.shouldRequeue).toBe(true);
+    expect(result.requeueDelayMs).toBe(40_000);
+    expect(result.slotAt).toBe(1_800_000_040_000);
+  });
+
+  it("allows more holds than the unpaced requeue budget", async () => {
+    mockEval.mockResolvedValue([0, 5, 0, 600_000, 640_000, 1_800_000_640_000]);
+
+    expect((await reserveDMSlot("account_123", 3)).shouldRequeue).toBe(true);
+    expect(
+      (await reserveDMSlot("account_123", MAX_PACED_REQUEUE_ATTEMPTS)).shouldSkip
+    ).toBe(true);
+  });
+
+  it("skips a comment when the schedule is already a day deep", async () => {
+    mockEval.mockResolvedValue([0, 5, 0, 0, -1, 0]);
+
+    const result = await reserveDMSlot("account_123", 0);
+
+    expect(result.shouldSkip).toBe(true);
+    expect(result.shouldRequeue).toBe(false);
+  });
+});
+
+describe("account-wide block", () => {
+  it("records a refusal per commenter and reports a block", async () => {
+    mockEval.mockResolvedValue(1);
+
+    await expect(recordThreadRefusal("account_123", "commenter_1")).resolves.toBe(true);
+    expect(mockEval).toHaveBeenCalledWith(
+      expect.any(String),
+      2,
+      "rate:dm:refused:account_123",
+      "rate:dm:blocked:account_123",
+      expect.any(Number),
+      THREAD_REFUSAL_WINDOW_MS,
+      THREAD_REFUSAL_BURST,
+      ACCOUNT_BLOCK_MEMORY_MS,
+      "commenter_1"
+    );
+  });
+
+  it("reports no block for an isolated refusal", async () => {
+    mockEval.mockResolvedValue(0);
+
+    await expect(recordThreadRefusal("account_123", "commenter_1")).resolves.toBe(false);
+  });
+
+  it("forgets the block and the refusal count after a delivered DM", async () => {
+    mockDel.mockResolvedValue(2);
+
+    await clearAccountBlock("account_123");
+
+    expect(mockDel).toHaveBeenCalledWith(
+      "rate:dm:blocked:account_123",
+      "rate:dm:refused:account_123"
     );
   });
 });
