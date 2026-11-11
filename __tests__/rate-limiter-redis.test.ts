@@ -85,11 +85,41 @@ describe.skipIf(!redisUrl)("rate limiter scripts on Redis", () => {
     it("lets a late owner send but keeps the next send an interval away", async () => {
       await rl.reserveDMSlot(ig, 0, 0, "c1");
       const a = await rl.reserveDMSlot(ig, 0, 0, "c2");
-      at(40_000 + 50_000); // 50 s late, still within the grace
+      at(40_000 + 30_000); // 30 s late, within the grace
       expect((await rl.reserveDMSlot(ig, 1, a.slotAt, "c2")).allowed).toBe(true);
       const next = await rl.reserveDMSlot(ig, 0, 0, "c3");
       expect(next.allowed).toBe(false);
       expect(next.requeueDelayMs).toBe(40_000);
+    });
+
+    it("never lets a late owner send right after a comment that took the free slot", async () => {
+      await rl.reserveDMSlot(ig, 0, 0, "c1");
+      const a = await rl.reserveDMSlot(ig, 0, 0, "c2"); // slot 40 s; next free 80 s
+      at(85_000);
+      expect((await rl.reserveDMSlot(ig, 0, 0, "c3")).allowed).toBe(true);
+      at(85_500); // c2 arrives 45.5 s late: more than an interval, so a new slot
+      const late = await rl.reserveDMSlot(ig, 1, a.slotAt, "c2");
+      expect(late.allowed).toBe(false);
+      expect(late.slotAt).toBe(T0 + 125_000);
+    });
+
+    it("takes no slot for a comment that is out of holds", async () => {
+      await rl.reserveDMSlot(ig, 0, 0, "c1");
+      const before = await redis.get(`rate:dm:next:${ig}`);
+      const res = await rl.reserveDMSlot(ig, rl.MAX_HELD_REQUEUE_ATTEMPTS, 0, "c2");
+      expect(res.shouldSkip).toBe(true);
+      expect(await redis.get(`rate:dm:next:${ig}`)).toBe(before);
+      expect(await redis.exists(`rate:dm:held:${ig}:c2`)).toBe(0);
+    });
+
+    it("releases a held slot only if it is still the one recorded", async () => {
+      await rl.reserveDMSlot(ig, 0, 0, "c0");
+      const held = await rl.reserveDMSlot(ig, 0, 0, "c1");
+      await rl.releaseHeldSlot(ig, "c1", held.slotAt! + 1);
+      expect(await redis.exists(`rate:dm:held:${ig}:c1`)).toBe(1);
+      await rl.releaseHeldSlot(ig, "c1", held.slotAt!);
+      expect(await redis.exists(`rate:dm:held:${ig}:c1`)).toBe(0);
+      expect((await rl.reserveDMSlot(ig, 0, 0, "c1")).duplicate).toBeUndefined();
     });
 
     it("re-slots a job that comes back long after its slot instead of bursting", async () => {
@@ -183,9 +213,21 @@ describe.skipIf(!redisUrl)("rate limiter scripts on Redis", () => {
       expect(await rl.recordThreadRefusal(ig, "E")).toBe(false);
     });
 
-    it("does nothing on delivery when no block is remembered", async () => {
-      expect(await rl.recordDelivery(ig)).toBe(false);
-      expect(await redis.exists(`rate:dm:delivered:${ig}`)).toBe(0);
+    it("never adds up isolated refusals separated by deliveries", async () => {
+      await rl.recordThreadRefusal(ig, "A");
+      for (let i = 0; i < 3; i++) await rl.recordDelivery(ig);
+      await rl.recordThreadRefusal(ig, "B");
+      for (let i = 0; i < 3; i++) await rl.recordDelivery(ig);
+      expect(await rl.recordThreadRefusal(ig, "C")).toBe(false);
+    });
+
+    it("still catches a burst with a few deliveries mixed in", async () => {
+      await rl.recordThreadRefusal(ig, "A");
+      await rl.recordDelivery(ig);
+      await rl.recordThreadRefusal(ig, "B");
+      await rl.recordDelivery(ig);
+      await rl.recordDelivery(ig);
+      expect(await rl.recordThreadRefusal(ig, "C")).toBe(true);
     });
   });
 });

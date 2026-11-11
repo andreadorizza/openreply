@@ -42,7 +42,8 @@ const MAX_HELD_REQUEUE_ATTEMPTS = 48;
 // day late is already a poor answer, and Instagram stops allowing a private
 // reply 7 days after the comment.
 const MAX_PACED_HOLD_MS = 24 * 60 * 60 * 1000;
-// How far a job may run before or after its slot and still own it.
+// How far a job may run before or after its slot and still own it. Later than
+// that (and never as late as one interval), it takes a new slot.
 const SLOT_EARLY_MS = 1000;
 const SLOT_LATE_MS = 60 * 1000;
 
@@ -115,6 +116,7 @@ local now = tonumber(ARGV[5])
 local max_hold = tonumber(ARGV[6])
 local early = tonumber(ARGV[7])
 local late = tonumber(ARGV[8])
+local may_hold = tonumber(ARGV[9])
 
 local paused_ms = tonumber(redis.call("PTTL", KEYS[2]))
 if paused_ms < 0 then
@@ -141,7 +143,8 @@ if interval > 0 then
     end
     if free_at > now then
       local wait = free_at - now
-      if wait > max_hold then
+      -- Skipping: out of holds, or a day deep. Take no slot for it.
+      if may_hold == 0 or wait > max_hold then
         return {0, current, 0, paused_ms, -1, 0}
       end
       redis.call("SET", KEYS[3], free_at + interval, "PX", wait + interval)
@@ -294,25 +297,24 @@ export async function recordThreadRefusal(
   return toScriptNumber(result) === 1;
 }
 
-// Only while a block is remembered: count deliveries since the last refusal,
-// and forget the block (and the refusal count) after enough in a row.
+// Count deliveries since the last refusal. Enough in a row reset the refusal
+// count, so isolated refusals hours apart never add up to a burst, and forget
+// any remembered block.
 const RECORD_DELIVERY_SCRIPT = `
-if redis.call("EXISTS", KEYS[1]) == 0 then
-  return 0
-end
 local streak = redis.call("INCR", KEYS[3])
 redis.call("PEXPIRE", KEYS[3], ARGV[2])
 if streak >= tonumber(ARGV[1]) then
+  local was_blocked = redis.call("EXISTS", KEYS[1])
   redis.call("DEL", KEYS[1], KEYS[2], KEYS[3])
-  return 1
+  return was_blocked
 end
 return 0
 `;
 
 /**
- * A comment DM was delivered. Once DELIVERIES_TO_CLEAR_BLOCK arrive with no
- * refusal in between, a remembered block is over and is forgotten. Returns
- * true when this delivery cleared it.
+ * A comment DM was delivered. After DELIVERIES_TO_CLEAR_BLOCK in a row with no
+ * refusal between them, the refusal count starts again and any remembered
+ * block is forgotten. Returns true when this delivery ended a block.
  */
 export async function recordDelivery(instagramAccountId: string): Promise<boolean> {
   const result = await getRedis().eval(
@@ -325,6 +327,32 @@ export async function recordDelivery(instagramAccountId: string): Promise<boolea
     ACCOUNT_BLOCK_MEMORY_MS
   );
   return toScriptNumber(result) === 1;
+}
+
+const RELEASE_HELD_SLOT_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  redis.call("DEL", KEYS[1])
+  return 1
+end
+return 0
+`;
+
+/**
+ * Give up a comment's held slot when no job ended up waiting for it, so later
+ * jobs for the comment are not taken for duplicates of a job that does not
+ * exist. Only removes it if it still records this slot.
+ */
+export async function releaseHeldSlot(
+  instagramAccountId: string,
+  commentId: string,
+  slotAt: number
+): Promise<void> {
+  await getRedis().eval(
+    RELEASE_HELD_SLOT_SCRIPT,
+    1,
+    heldCommentKey(instagramAccountId, commentId),
+    String(slotAt)
+  );
 }
 
 /**
@@ -398,6 +426,7 @@ export async function reserveDMSlot(
   const client = getRedis();
   const key = `rate:dm:${instagramAccountId}`;
 
+  const interval = commentDmIntervalMs();
   const result = await client.eval(
     RESERVE_DM_SLOT_SCRIPT,
     4,
@@ -407,12 +436,15 @@ export async function reserveDMSlot(
     heldCommentKey(instagramAccountId, commentId),
     RATE_LIMIT_MAX,
     RATE_LIMIT_WINDOW,
-    commentDmIntervalMs(),
+    interval,
     slotAt,
     Date.now(),
     MAX_PACED_HOLD_MS,
     SLOT_EARLY_MS,
-    SLOT_LATE_MS
+    // Less than an interval, so a late owner can never land right next to a
+    // send that took the free slot after it.
+    Math.min(SLOT_LATE_MS, Math.max(SLOT_EARLY_MS, interval - SLOT_EARLY_MS)),
+    requeueAttempt < MAX_HELD_REQUEUE_ATTEMPTS ? 1 : 0
   );
   const values = Array.isArray(result) ? result : [];
   const allowedFlag = toScriptNumber(values[0]);

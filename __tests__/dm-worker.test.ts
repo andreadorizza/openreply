@@ -16,6 +16,7 @@ const {
   mockPauseDMSends,
   mockRecordThreadRefusal,
   mockRecordDelivery,
+  mockReleaseHeldSlot,
   mockQueueAdd,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
@@ -56,6 +57,7 @@ const {
   mockPauseDMSends: vi.fn(),
   mockRecordThreadRefusal: vi.fn(),
   mockRecordDelivery: vi.fn(),
+  mockReleaseHeldSlot: vi.fn(),
   mockQueueAdd: vi.fn(),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
@@ -109,6 +111,7 @@ vi.mock("@/lib/utils/rate-limiter", () => ({
   pauseDMSends: mockPauseDMSends,
   recordThreadRefusal: mockRecordThreadRefusal,
   recordDelivery: mockRecordDelivery,
+  releaseHeldSlot: mockReleaseHeldSlot,
   ACCOUNT_BLOCK_PAUSE_MS: 1_800_000,
 }));
 
@@ -276,6 +279,7 @@ beforeEach(() => {
   mockPauseDMSends.mockResolvedValue(undefined);
   mockRecordThreadRefusal.mockResolvedValue(false);
   mockRecordDelivery.mockResolvedValue(false);
+  mockReleaseHeldSlot.mockResolvedValue(undefined);
   mockReleaseWorkspaceDMReservation.mockResolvedValue({ count: 1 });
   mockSendPrivateReply.mockResolvedValue({
     recipient_id: "commenter_999",
@@ -1162,7 +1166,11 @@ describe("DM Worker — Instagram blocking the whole account", () => {
     expect(mockQueueAdd).toHaveBeenCalledWith(
       "process-comment",
       expect.objectContaining({ commentId: "comment_555", requeueAttempt: 1 }),
-      expect.objectContaining({ delay: 1_800_000 })
+      expect.objectContaining({
+        delay: 1_800_000,
+        // Never dropped as a duplicate of a job kept from an earlier hold.
+        jobId: expect.stringMatching(/^comment_ig_456_comment_555_block_\d+$/),
+      })
     );
   });
 
@@ -1248,7 +1256,7 @@ describe("DM Worker — Instagram blocking the whole account", () => {
     );
   });
 
-  it("leaves the DM to the job that already holds the comment's slot", async () => {
+  it("holds for the pause even when another job claims to hold the comment", async () => {
     mockPrisma.dmLog.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({ attempts: 1 });
     mockSendPrivateReply.mockRejectedValue(threadRefusal());
     mockRecordThreadRefusal.mockResolvedValue(true);
@@ -1267,13 +1275,19 @@ describe("DM Worker — Instagram blocking the whole account", () => {
     const processor = getProcessor();
     await processor(createMockJob());
 
-    // Its own claim is released, but no second job is queued.
+    // That job may be gone (its own hold write can fail while this claim was in
+    // flight), so this one is queued anyway, without a slot; if the other is
+    // alive, the requeued job becomes the duplicate and steps aside.
     expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: "PENDING", dmDeliveryUnconfirmed: false }),
       })
     );
-    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-comment",
+      expect.objectContaining({ slotAt: undefined }),
+      expect.objectContaining({ delay: 1_800_000 })
+    );
   });
 });
 
@@ -1299,6 +1313,8 @@ describe("DM Worker — paced comment DMs", () => {
       where: expect.objectContaining({
         status: { not: "SENT" },
         dmDeliveryUnconfirmed: false,
+        // Never reopens a comment that has used all its tries.
+        attempts: { lt: 3 },
       }),
       data: expect.objectContaining({
         status: "PENDING",
@@ -1383,6 +1399,12 @@ describe("DM Worker — paced comment DMs", () => {
     await processor(createMockJob());
 
     expect(mockQueueAdd).not.toHaveBeenCalled();
+    // No job waits for the slot, so later jobs must not be taken for duplicates.
+    expect(mockReleaseHeldSlot).toHaveBeenCalledWith(
+      "ig_456",
+      "comment_555",
+      1_800_000_040_000
+    );
   });
 });
 

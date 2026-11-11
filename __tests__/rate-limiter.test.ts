@@ -121,7 +121,8 @@ describe("reserveDMSlot", () => {
       expect.any(Number),
       MAX_PACED_HOLD_MS,
       expect.any(Number),
-      expect.any(Number)
+      expect.any(Number),
+      1 // may still hold
     );
     expect(result.allowed).toBe(true);
     expect(result.reserved).toBe(true);
@@ -260,6 +261,19 @@ describe("reserveDMSlot with pacing", () => {
     expect(args[7]).toBe(3600);
     expect(args[8]).toBe(40_000);
     expect(args[9]).toBe(1_800_000_040_000);
+    // A late owner keeps its slot for less than one interval.
+    expect(args[13]).toBe(39_000);
+    expect(args[14]).toBe(1);
+  });
+
+  it("tells the script not to hold once the hold budget is spent", async () => {
+    process.env.COMMENT_DM_MAX_PER_HOUR = "90";
+    mockEval.mockResolvedValue([0, 5, 0, 0, -1, 0]);
+
+    const result = await reserveDMSlot("account_123", MAX_HELD_REQUEUE_ATTEMPTS, 0, "c_1");
+
+    expect(mockEval.mock.calls[0][14]).toBe(0);
+    expect(result.shouldSkip).toBe(true);
   });
 
   it("holds a comment for its slot and returns the slot", async () => {

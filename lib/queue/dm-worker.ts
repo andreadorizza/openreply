@@ -45,6 +45,7 @@ import {
   pauseDMSends,
   recordDelivery,
   recordThreadRefusal,
+  releaseHeldSlot,
   reserveDMSlot,
   releaseDMSlot,
   type RateLimitResult,
@@ -344,6 +345,7 @@ async function holdComment(
     commentId,
     status: { not: "SENT" as const },
     dmDeliveryUnconfirmed: ownsClaim,
+    attempts: { lt: MAX_COMMENT_SEND_ATTEMPTS },
   };
   const clearClaim = ownsClaim ? { dmDeliveryUnconfirmed: false } : {};
 
@@ -374,7 +376,15 @@ async function holdComment(
       ...clearClaim,
     },
   });
-  if (held.count !== 1) return false;
+  if (held.count !== 1) {
+    // Nothing to hold (sent, claimed, or out of tries): give the slot back.
+    if (rateLimit.slotAt) {
+      await releaseHeldSlot(instagramAccountId, commentId, rateLimit.slotAt).catch(
+        () => {}
+      );
+    }
+    return false;
+  }
   // Another job already holds this comment's slot and will send it.
   if (rateLimit.duplicate) return true;
 
@@ -386,9 +396,12 @@ async function holdComment(
       delay: rateLimit.requeueDelayMs,
       // One id per slot for a paced hold: a fixed id could match a job kept from
       // an earlier hold of the same comment, and BullMQ would drop the add.
+      // The block path's hold must never be dropped as a duplicate either.
       jobId: rateLimit.slotAt
         ? `comment_${instagramAccountId}_${commentId}_slot_${rateLimit.slotAt}`
-        : `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt}`,
+        : ownsClaim
+          ? `comment_${instagramAccountId}_${commentId}_block_${Date.now()}`
+          : `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt}`,
     }
   );
   return true;
@@ -931,15 +944,21 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           // Taken during the pause, so the slot is after it (and spaced out
           // from the other held comments when pacing is on).
           let hold = await reserveDMSlot(instagramAccountId, requeueAttempt, 0, commentId);
-          if (hold.allowed) {
-            // The pause did not take; hold for its length anyway.
+          // The pause did not take, or another job claims to hold the comment
+          // (it may be gone: its hold write can fail while this claim was in
+          // flight). Hold for the pause anyway, with no slot: a live job will
+          // make the requeued one a duplicate, which then steps aside.
+          if (hold.allowed || hold.duplicate) {
             if (hold.reserved) await releaseDMSlot(instagramAccountId);
             hold = {
               ...hold,
               allowed: false,
               reserved: false,
+              duplicate: false,
+              shouldSkip: false,
               shouldRequeue: true,
               requeueDelayMs: ACCOUNT_BLOCK_PAUSE_MS,
+              slotAt: undefined,
             };
           }
           const deferred = await holdComment(
