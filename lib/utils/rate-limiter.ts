@@ -30,7 +30,8 @@ const META_PAUSE_JITTER_MS = 2 * 60 * 1000;
 
 // Optional pacing (COMMENT_DM_MAX_PER_HOUR). Instagram can refuse every new
 // conversation from an account long before Meta's documented cap: one account
-// was blocked for hours, twice, at about 150 private replies an hour. Pacing
+// was blocked for hours at about 134 private replies an hour, and again at
+// about 85 an hour after some 960 in 12 hours. Pacing
 // gives each comment DM its own time slot, evenly spaced, and comments over the
 // rate wait in the queue for theirs instead of being dropped.
 //
@@ -50,18 +51,16 @@ const SLOT_LATE_MS = 60 * 1000;
 // Account-wide block. Meta answers a private reply with code 100, subcode
 // 2534001 ("the thread owner has archived or deleted this conversation") both
 // when one commenter has closed their DMs and when Instagram refuses every new
-// conversation from the account. A few of them from different commenters in a
-// short window means the second.
+// conversation from the account. Several in a row from different commenters,
+// with no delivery between them, means the second: during a block nearly every
+// new conversation is refused, while one closed thread shows up about once a
+// day. A delivery starts the count again, so on a busy account a few commenters
+// who closed their DMs cannot pause it, and each pause needs a fresh burst.
 const THREAD_REFUSAL_WINDOW_MS = 10 * 60 * 1000;
 const THREAD_REFUSAL_BURST = 3;
 // Pause for a block. Sending into it does not end it: the last block lifted
 // about half an hour after the retries stopped.
 const ACCOUNT_BLOCK_PAUSE_MS = 30 * 60 * 1000;
-// While a block is remembered, a single refusal counts as the block still
-// being on. It is cleared by this many delivered comment DMs in a row, not one:
-// people who already had a thread with the account still get DMs mid-block.
-const ACCOUNT_BLOCK_MEMORY_MS = 6 * 60 * 60 * 1000;
-const DELIVERIES_TO_CLEAR_BLOCK = 3;
 
 let redis: Redis | null = null;
 
@@ -219,14 +218,6 @@ function threadRefusalsKey(instagramAccountId: string): string {
   return `rate:dm:refused:${instagramAccountId}`;
 }
 
-function accountBlockKey(instagramAccountId: string): string {
-  return `rate:dm:blocked:${instagramAccountId}`;
-}
-
-function deliveryStreakKey(instagramAccountId: string): string {
-  return `rate:dm:delivered:${instagramAccountId}`;
-}
-
 function heldCommentKey(instagramAccountId: string, commentId?: string): string {
   return `rate:dm:held:${instagramAccountId}:${commentId ?? "-"}`;
 }
@@ -258,16 +249,18 @@ export async function pauseDMSends(
   await getRedis().eval(EXTEND_PAUSE_SCRIPT, 1, pauseKey(instagramAccountId), pauseMs);
 }
 
+// The set holds one member per commenter, so a retry of the same comment does
+// not count twice. It is not cleared when a block is found: refusals of sends
+// already in flight belong to the same block. It expires a window after the
+// last refusal, which is well inside the block pause, so the next pause needs
+// a fresh burst.
 const RECORD_THREAD_REFUSAL_SCRIPT = `
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
-redis.call("DEL", KEYS[3])
-redis.call("ZADD", KEYS[1], now, ARGV[5])
+redis.call("ZADD", KEYS[1], now, ARGV[4])
 redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", now - window)
 redis.call("PEXPIRE", KEYS[1], window)
-if redis.call("EXISTS", KEYS[2]) == 1 or
-   redis.call("ZCARD", KEYS[1]) >= tonumber(ARGV[3]) then
-  redis.call("SET", KEYS[2], "1", "PX", ARGV[4])
+if redis.call("ZCARD", KEYS[1]) >= tonumber(ARGV[3]) then
   return 1
 end
 return 0
@@ -275,8 +268,9 @@ return 0
 
 /**
  * Record a "thread owner has archived or deleted this conversation" refusal
- * and report whether it is part of an account-wide block: a burst from several
- * different commenters, or any refusal while an earlier block is remembered.
+ * and report whether it is part of an account-wide block: THREAD_REFUSAL_BURST
+ * refusals from different commenters within the window, with no delivery
+ * between them.
  */
 export async function recordThreadRefusal(
   instagramAccountId: string,
@@ -284,49 +278,22 @@ export async function recordThreadRefusal(
 ): Promise<boolean> {
   const result = await getRedis().eval(
     RECORD_THREAD_REFUSAL_SCRIPT,
-    3,
+    1,
     threadRefusalsKey(instagramAccountId),
-    accountBlockKey(instagramAccountId),
-    deliveryStreakKey(instagramAccountId),
     Date.now(),
     THREAD_REFUSAL_WINDOW_MS,
     THREAD_REFUSAL_BURST,
-    ACCOUNT_BLOCK_MEMORY_MS,
     commenterId
   );
   return toScriptNumber(result) === 1;
 }
 
-// Count deliveries since the last refusal. Enough in a row reset the refusal
-// count, so isolated refusals hours apart never add up to a burst, and forget
-// any remembered block.
-const RECORD_DELIVERY_SCRIPT = `
-local streak = redis.call("INCR", KEYS[3])
-redis.call("PEXPIRE", KEYS[3], ARGV[2])
-if streak >= tonumber(ARGV[1]) then
-  local was_blocked = redis.call("EXISTS", KEYS[1])
-  redis.call("DEL", KEYS[1], KEYS[2], KEYS[3])
-  return was_blocked
-end
-return 0
-`;
-
 /**
- * A comment DM was delivered. After DELIVERIES_TO_CLEAR_BLOCK in a row with no
- * refusal between them, the refusal count starts again and any remembered
- * block is forgotten. Returns true when this delivery ended a block.
+ * A comment DM was delivered, so the account can still open conversations:
+ * start the refusal count again.
  */
-export async function recordDelivery(instagramAccountId: string): Promise<boolean> {
-  const result = await getRedis().eval(
-    RECORD_DELIVERY_SCRIPT,
-    3,
-    accountBlockKey(instagramAccountId),
-    threadRefusalsKey(instagramAccountId),
-    deliveryStreakKey(instagramAccountId),
-    DELIVERIES_TO_CLEAR_BLOCK,
-    ACCOUNT_BLOCK_MEMORY_MS
-  );
-  return toScriptNumber(result) === 1;
+export async function recordDelivery(instagramAccountId: string): Promise<void> {
+  await getRedis().del(threadRefusalsKey(instagramAccountId));
 }
 
 const RELEASE_HELD_SLOT_SCRIPT = `
@@ -574,6 +541,4 @@ export {
   THREAD_REFUSAL_WINDOW_MS,
   THREAD_REFUSAL_BURST,
   ACCOUNT_BLOCK_PAUSE_MS,
-  ACCOUNT_BLOCK_MEMORY_MS,
-  DELIVERIES_TO_CLEAR_BLOCK,
 };

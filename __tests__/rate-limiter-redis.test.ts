@@ -195,39 +195,34 @@ describe.skipIf(!redisUrl)("rate limiter scripts on Redis", () => {
       expect(await rl.recordThreadRefusal(ig, "C")).toBe(false);
     });
 
-    it("remembers a block: one refusal later still counts", async () => {
+    it("counts refusals of sends already in flight as the same block", async () => {
       for (const c of ["A", "B", "C"]) await rl.recordThreadRefusal(ig, c);
-      at(45 * 60_000);
+      at(60_000);
       expect(await rl.recordThreadRefusal(ig, "D")).toBe(true);
     });
 
-    it("forgets a block only after three deliveries in a row", async () => {
+    it("needs a fresh burst after a block pause", async () => {
       for (const c of ["A", "B", "C"]) await rl.recordThreadRefusal(ig, c);
-      expect(await rl.recordDelivery(ig)).toBe(false);
-      expect(await rl.recordDelivery(ig)).toBe(false);
-      // A refusal in between starts the count again.
-      expect(await rl.recordThreadRefusal(ig, "D")).toBe(true);
-      expect(await rl.recordDelivery(ig)).toBe(false);
-      expect(await rl.recordDelivery(ig)).toBe(false);
-      expect(await rl.recordDelivery(ig)).toBe(true);
+      at(31 * 60_000);
+      expect(await rl.recordThreadRefusal(ig, "D")).toBe(false);
       expect(await rl.recordThreadRefusal(ig, "E")).toBe(false);
+      expect(await rl.recordThreadRefusal(ig, "F")).toBe(true);
     });
 
-    it("never adds up isolated refusals separated by deliveries", async () => {
+    it("starts the count again after any delivery", async () => {
       await rl.recordThreadRefusal(ig, "A");
-      for (let i = 0; i < 3; i++) await rl.recordDelivery(ig);
       await rl.recordThreadRefusal(ig, "B");
-      for (let i = 0; i < 3; i++) await rl.recordDelivery(ig);
+      await rl.recordDelivery(ig);
       expect(await rl.recordThreadRefusal(ig, "C")).toBe(false);
+      expect(await rl.recordThreadRefusal(ig, "D")).toBe(false);
+      expect(await rl.recordThreadRefusal(ig, "E")).toBe(true);
     });
 
-    it("still catches a burst with a few deliveries mixed in", async () => {
-      await rl.recordThreadRefusal(ig, "A");
-      await rl.recordDelivery(ig);
-      await rl.recordThreadRefusal(ig, "B");
-      await rl.recordDelivery(ig);
-      await rl.recordDelivery(ig);
-      expect(await rl.recordThreadRefusal(ig, "C")).toBe(true);
+    it("never adds up refusals separated by deliveries", async () => {
+      for (const c of ["A", "B", "C", "D"]) {
+        expect(await rl.recordThreadRefusal(ig, c)).toBe(false);
+        await rl.recordDelivery(ig);
+      }
     });
   });
 });

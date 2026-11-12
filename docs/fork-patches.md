@@ -26,18 +26,18 @@ Pull request andreadorizza/openreply#7: commits `415fb7a`, `8db470e` and `6e2269
 **What the fork does.**
 
 - `COMMENT_DM_MAX_PER_HOUR`, off by default, gives each comment DM its own evenly spaced send slot per account in Redis. A comment over the rate waits in the queue for its slot, for up to a day, instead of being sent at once. Production uses `90`.
-- Three or more 2534001 refusals from different commenters within 10 minutes count as an account-wide block. Comment DMs pause for 30 minutes, and the refused comment is held instead of failed. For 6 hours afterwards a single refusal pauses again. Three deliveries in a row clear the block.
+- Three 2534001 refusals in a row, from different commenters within 10 minutes and with no delivery between them, count as an account-wide block. Comment DMs pause for 30 minutes, and the refused comment is held instead of failed. Each pause needs a fresh burst: any delivery starts the count again. The refusals before the burst is recognised fail and are retried; the retries land in the pause and are held.
 - `pauseDMSends` only extends a pause, so a shorter rate-limit pause cannot cut a block pause short.
 
 **Code.**
 
-- `lib/utils/rate-limiter.ts`: `commentDmIntervalMs`, the slot logic in `reserveDMSlot`, `recordThreadRefusal`, `recordDelivery`, `releaseHeldSlot`, the Lua scripts they run, and the `SLOT_*`, `MAX_HELD_REQUEUE_ATTEMPTS`, `MAX_PACED_HOLD_MS`, `THREAD_REFUSAL_*`, `ACCOUNT_BLOCK_*` and `DELIVERIES_TO_CLEAR_BLOCK` constants.
+- `lib/utils/rate-limiter.ts`: `commentDmIntervalMs`, the slot logic in `reserveDMSlot`, `recordThreadRefusal`, `recordDelivery`, `releaseHeldSlot`, the Lua scripts they run, and the `SLOT_*`, `MAX_HELD_REQUEUE_ATTEMPTS`, `MAX_PACED_HOLD_MS`, `THREAD_REFUSAL_*` and `ACCOUNT_BLOCK_PAUSE_MS` constants.
 - `lib/queue/dm-worker.ts`: `isThreadRefusal`, `holdComment` and the account-block path.
 - `lib/queue/client.ts`: `slotAt` on `ProcessCommentJob`.
 - `docs/setup.md`: the `COMMENT_DM_MAX_PER_HOUR` table and the paragraph after it.
 - Tests: `__tests__/rate-limiter.test.ts`, `__tests__/rate-limiter-redis.test.ts` (runs only when `TEST_REDIS_URL` is set) and the pacing and hold cases in `__tests__/dm-worker.test.ts`.
 
-**Upstream status.** Upstream has nothing equivalent. diwenne/openreply#114 (open) adds a random delay before each reply, per account. That makes replies look less automated, but it does not limit DMs per hour or detect a block, so it does not replace this patch. If #114 is merged, it changes the same files (`lib/queue/dm-worker.ts`, `lib/queue/client.ts`, `lib/queue/process-webhook.ts`). Keep both: a delayed DM job must still take a pacing slot and can still be held during a block.
+**Upstream status.** Proposed upstream as diwenne/openreply#116 (open, opened 2026-11-12), which builds on #115 (patch 2). It ports this patch with the same block rule, except that upstream retries a 2534001 refusal instead of failing it at once. diwenne/openreply#114 (open) adds a random delay before each reply, per account. That makes replies look less automated, but it does not limit DMs per hour or detect a block, so it does not replace this patch. If #114 is merged, it changes the same files (`lib/queue/dm-worker.ts`, `lib/queue/client.ts`, `lib/queue/process-webhook.ts`). Keep both: a delayed DM job must still take a pacing slot and can still be held during a block.
 
 **Remove when.**
 
@@ -56,15 +56,17 @@ Commit `78d1eb6`.
 
 **Code.** `lib/meta/client.ts` (the two `case` lines); `lib/utils/rate-limiter.ts` (`pauseDMSends`, the pause check in `reserveDMSlot`, `META_PAUSE_*`); the rate-limit branch in `lib/queue/dm-worker.ts`; tests in `__tests__/meta-errors.test.ts`, `__tests__/rate-limiter.test.ts` and `__tests__/dm-worker.test.ts`.
 
+**Upstream status.** Proposed upstream as diwenne/openreply#115 (open, opened 2026-11-12), a port of this patch.
+
 **Remove when.** Upstream classifies 613 and 80002 as rate limits and pauses or delays sends for that account when they occur.
 
 ## 3. Stop retrying private replies that Meta refuses for good
 
 Commits `c72c20c` and `78d1eb6`.
 
-**Why.** Upstream retried refusals that never succeed ("invalid for a private reply", closed messaging window, "user cannot be found", "thread owner has archived or deleted this conversation"). Each retry raised the same alert, and the comment sweep queued the same comments again on every pass, which added load during a throttle.
+**Why.** Upstream retried refusals that never succeed ("invalid for a private reply", closed messaging window, "user cannot be found"). Each retry raised the same alert, and the comment sweep queued the same comments again on every pass, which added load during a throttle.
 
-**What the fork does.** `isPermanentRejection` matches the messages in `NON_TEMPLATE_REJECTIONS`. Such a refusal fails the job once (`UnrecoverableError`) and uses up the comment's send budget, so the sweep stops queueing it again. With patch 1, a 2534001 refusal is first checked as a possible account block (`isThreadRefusal`).
+**What the fork does.** `isPermanentRejection` matches the messages in `NON_TEMPLATE_REJECTIONS`. Such a refusal fails the job once (`UnrecoverableError`) and uses up the comment's send budget, so the sweep stops queueing it again. A 2534001 refusal ("thread owner has archived or deleted this conversation") is not on that list: it may be the start of an account block (patch 1), so it is retried like upstream does.
 
 **Code.** `lib/queue/dm-worker.ts` (`isPermanentRejection`, `NON_TEMPLATE_REJECTIONS`, `describeSendFailure`); tests in `__tests__/dm-worker.test.ts`.
 
