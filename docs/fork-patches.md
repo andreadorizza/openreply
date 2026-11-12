@@ -37,7 +37,7 @@ Pull request andreadorizza/openreply#7: commits `415fb7a`, `8db470e` and `6e2269
 - `docs/setup.md`: the `COMMENT_DM_MAX_PER_HOUR` table and the paragraph after it.
 - Tests: `__tests__/rate-limiter.test.ts`, `__tests__/rate-limiter-redis.test.ts` (runs only when `TEST_REDIS_URL` is set) and the pacing and hold cases in `__tests__/dm-worker.test.ts`.
 
-**Upstream status.** Upstream has nothing equivalent. diwenne/openreply#114 (open) adds a random delay before each reply, per account. That makes replies look less automated, but it does not limit DMs per hour or detect a block, so it does not replace this patch. If #114 is merged, it changes the same files (`lib/queue/dm-worker.ts`, `lib/queue/client.ts`, `lib/queue/process-webhook.ts`). Keep both: a delayed DM job must still take a pacing slot and can still be held during a block.
+**Upstream status.** Proposed upstream as diwenne/openreply#116 (open, opened 2026-11-12), which builds on #115 (patch 2). It ports this patch with the same block rule, except that upstream retries a 2534001 refusal instead of failing it at once. diwenne/openreply#114 (open) adds a random delay before each reply, per account. That makes replies look less automated, but it does not limit DMs per hour or detect a block, so it does not replace this patch. If #114 is merged, it changes the same files (`lib/queue/dm-worker.ts`, `lib/queue/client.ts`, `lib/queue/process-webhook.ts`). Keep both: a delayed DM job must still take a pacing slot and can still be held during a block.
 
 **Remove when.**
 
@@ -55,6 +55,8 @@ Commit `78d1eb6`.
 **What the fork does.** Codes 613 and 80002 throw `RateLimitError`. A `RateLimitError` pauses the account's sends for 15 minutes (`pauseDMSends`). While the account is paused, `reserveDMSlot` refuses a slot and the job is requeued for the end of the pause, with up to 2 minutes of jitter. Other accounts are not affected.
 
 **Code.** `lib/meta/client.ts` (the two `case` lines); `lib/utils/rate-limiter.ts` (`pauseDMSends`, the pause check in `reserveDMSlot`, `META_PAUSE_*`); the rate-limit branch in `lib/queue/dm-worker.ts`; tests in `__tests__/meta-errors.test.ts`, `__tests__/rate-limiter.test.ts` and `__tests__/dm-worker.test.ts`.
+
+**Upstream status.** Proposed upstream as diwenne/openreply#115 (open, opened 2026-11-12), a port of this patch.
 
 **Remove when.** Upstream classifies 613 and 80002 as rate limits and pauses or delays sends for that account when they occur.
 
