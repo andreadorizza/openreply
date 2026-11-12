@@ -129,20 +129,19 @@ const NON_TEMPLATE_REJECTIONS = [
   /outside of allowed window/i,
   /invalid for a private reply/i,
   /requested user cannot be found/i,
-  // sub=2534001. Observed failing identically on all three retries, minutes
-  // apart, for every affected comment. Final for one commenter; a burst of them
-  // is an account-wide block instead, see isThreadRefusal.
-  /thread owner has archived or deleted this conversation/i,
 ];
 
-// Instagram gives the same answer when one commenter has closed their DMs and
-// when it refuses every new conversation from the account (twice for hours on a
-// viral reel, at about 150 private replies an hour). recordThreadRefusal tells
-// the two apart by counting refusals across commenters.
+// Code 100, subcode 2534001: "the thread owner has archived or deleted this
+// conversation". Instagram gives this same answer when one commenter has
+// closed their DMs and when it refuses every new conversation from the account
+// (observed twice for hours on a busy reel, at about 134 and 85 private replies
+// an hour). recordThreadRefusal tells the two apart by counting refusals across
+// commenters.
 function isThreadRefusal(error: unknown): boolean {
   return (
     error instanceof MetaApiError &&
-    /thread owner has archived or deleted this conversation/i.test(error.message)
+    (error.subcode === 2534001 ||
+      /thread owner has archived or deleted this conversation/i.test(error.message))
   );
 }
 
@@ -151,7 +150,10 @@ const ACCOUNT_BLOCK_HOLD_MESSAGE =
 
 // Every pattern above is a verdict on the comment or conversation, so the job
 // retries (5, 15, 45 minutes later) fail identically: three alerts for one
-// comment and a log row that reads like a transient outage.
+// comment and a log row that reads like a transient outage. 2534001 (see
+// isThreadRefusal) is deliberately not here: the refusals that start a block
+// cannot be told apart from a closed thread yet, and their retries are what
+// gets them held once the block is recognised.
 function isPermanentRejection(error: unknown): boolean {
   if (error instanceof TokenExpiredError || error instanceof RateLimitError) {
     return false;
@@ -877,7 +879,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: null,
         },
       });
-      // Enough of these in a row and a remembered block is over.
+      // The account can still open conversations: start the refusal count again.
       await recordDelivery(instagramAccountId).catch((recordError) =>
         console.error(
           "[DM Worker] Failed to record a delivery:",
@@ -904,8 +906,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       }
       // Instagram refusing every new conversation from the account: pause it,
       // and hold this comment for when the block lifts instead of dropping it.
-      // A comment refused on every try is still final, so one genuinely closed
-      // thread cannot keep the account paused.
+      // The refusals before the burst was recognised fail as usual; their
+      // retries come back during the pause and are held then. A comment
+      // refused on every try is still final, so one genuinely closed thread
+      // cannot keep the account paused.
       const accountBlocked =
         !delivered &&
         isThreadRefusal(sendError) &&

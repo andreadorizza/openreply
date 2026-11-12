@@ -132,9 +132,9 @@ Optional, for busy posts:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `COMMENT_DM_MAX_PER_HOUR` | unset (no pacing) | Spaces comment DMs evenly, at most this many per hour per account. Comments over the rate wait in the queue for their turn, up to a day. Instagram can refuse every new conversation from an account well below Meta's documented 750 private replies an hour; one account was blocked for hours at about 150 an hour, so start around `90`. |
+| `COMMENT_DM_MAX_PER_HOUR` | unset (no pacing) | Spaces comment DMs evenly, at most this many per hour per account. Comments over the rate wait in the queue for their turn, up to a day. Instagram can refuse every new conversation from an account well below Meta's documented 750 private replies an hour, and it does not publish the threshold. One account was blocked for hours at about 134 an hour, and again at about 85 an hour after some 960 in 12 hours. `90` is a reasonable start; lower it if your account still gets blocked. |
 
-Separately from pacing, the worker treats several "thread owner has archived or deleted this conversation" refusals from different commenters within 10 minutes as Instagram blocking the whole account: it pauses comment DMs for 30 minutes and holds those comments instead of failing them, until three DMs in a row go through. Without pacing, held comments all come back when a pause ends; with pacing they come back one by one.
+Separately from pacing, the worker treats three "thread owner has archived or deleted this conversation" refusals (code 100, subcode 2534001) in a row, from different commenters within 10 minutes and with no DM delivered between them, as Instagram blocking the whole account. It pauses comment DMs for 30 minutes and holds those comments instead of failing them. If the block is still on after the pause, the next burst of refusals pauses again. Without pacing, held comments all come back when a pause ends; with pacing they come back one by one. This applies to accounts connected directly to Meta; Zernio errors do not carry the subcode.
 
 ## Connect through Zernio
 
