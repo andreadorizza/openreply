@@ -3,6 +3,7 @@ import { getI18n } from "@/lib/i18n/server";
 import { getCampaignTemplate } from "@/lib/templates/campaign-templates";
 import { DemoNotice } from "@/components/demo-notice";
 import { isPublicDemoHost } from "@/lib/env";
+import { LogoMark } from "@/components/site/logo";
 import { siteClass } from "@/components/site/shell";
 import Link from "next/link";
 import { ArrowUpRightIcon, CaretLeftIcon } from "@/components/site/icons";
@@ -84,7 +85,14 @@ export default async function LoginPage({
           <div>
             <div className="auth-head">
               <h1 className={checkEmail ? "heading-5" : "wordmark"} style={checkEmail ? undefined : { fontSize: 32, lineHeight: "40px" }}>
-                {checkEmail ? t("Check your email") : "OpenReply"}
+                {checkEmail ? (
+                  t("Check your email")
+                ) : (
+                  <>
+                    <LogoMark className="wordmark-mark" />
+                    <span>OpenReply</span>
+                  </>
+                )}
               </h1>
               <p className="body-6">
                 {checkEmail

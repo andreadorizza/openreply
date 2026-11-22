@@ -18,6 +18,7 @@ import {
   InstagramDm,
   InstagramPost,
 } from "@/components/site/instagram";
+import { Carousel } from "@/components/site/carousel";
 import { Faq } from "@/components/site/faq";
 import { Reveal, TaglineReveal } from "@/components/site/reveal";
 import { SiteFooter, SiteHeader, siteClass } from "@/components/site/shell";
@@ -127,22 +128,39 @@ export default function Home() {
             role="group"
             aria-label="A comment on an Instagram post becomes a private DM"
           >
-            <div className="stage-col stage-col-left stage-wrap">
-              <InstagramPost />
-            </div>
-            <div className="stage-mid">
-              <span className="stage-chip caption-4">
-                Keyword <code>GUIDE</code> matched
-              </span>
-              <span className="stage-line" aria-hidden="true" />
-              <span className="stage-chip caption-4">Private reply</span>
-              <span className="stage-note caption-5">
-                Sent through the official Instagram API
-              </span>
-            </div>
-            <div className="stage-col stage-col-right stage-wrap">
-              <InstagramDm />
-            </div>
+            <Carousel className="stage-track" label="Comment and reply">
+              <div className="stage-col stage-col-left">
+                <div className="stage-wrap">
+                  <InstagramPost />
+                </div>
+                <div className="stage-cap">
+                  <span className="stage-chip caption-4">
+                    Keyword <code>GUIDE</code> matched
+                  </span>
+                </div>
+              </div>
+              <div className="stage-mid">
+                <span className="stage-chip caption-4">
+                  Keyword <code>GUIDE</code> matched
+                </span>
+                <span className="stage-line" aria-hidden="true" />
+                <span className="stage-chip caption-4">Private reply</span>
+                <span className="stage-note caption-5">
+                  Sent through the official Instagram API
+                </span>
+              </div>
+              <div className="stage-col stage-col-right">
+                <div className="stage-wrap">
+                  <InstagramDm />
+                </div>
+                <div className="stage-cap">
+                  <span className="stage-chip caption-4">Private reply</span>
+                  <span className="stage-note caption-5">
+                    Sent through the official Instagram API
+                  </span>
+                </div>
+              </div>
+            </Carousel>
           </div>
 
           <p className="hero-support caption-4">
@@ -293,7 +311,7 @@ export default function Home() {
           <Reveal className="section-head">
             <h2 className="heading-4">Features</h2>
           </Reveal>
-          <div className="bento">
+          <Carousel className="bento" label="Features">
             <Reveal className="cell cell-a">
               <div className="cell-visual cell-visual-split">
                 <DmPanel>
@@ -398,7 +416,7 @@ export default function Home() {
                 </p>
               </div>
             </Reveal>
-          </div>
+          </Carousel>
         </section>
 
         {/* Open source */}

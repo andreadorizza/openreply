@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { GITHUB_API_REPO, parseStars } from "./github-shared";
+import { LogoMark } from "./logo";
 import { ArrowUpRightIcon, GithubIcon } from "./icons";
 
 export interface NavLink {
@@ -70,7 +71,8 @@ export function SiteNav({
               aria-label="OpenReply home"
               onClick={() => setOpen(false)}
             >
-              OpenReply
+              <LogoMark className="wordmark-mark" />
+              <span>OpenReply</span>
             </Link>
             <a
               className="nav-stars"

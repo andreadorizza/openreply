@@ -135,14 +135,17 @@ const NON_TEMPLATE_REJECTIONS = [
   /thread owner has archived or deleted this conversation/i,
 ];
 
-// Instagram gives the same answer when one commenter has closed their DMs and
-// when it refuses every new conversation from the account (twice for hours on a
-// viral reel, at about 150 private replies an hour). recordThreadRefusal tells
-// the two apart by counting refusals across commenters.
+// Code 100, subcode 2534001: "the thread owner has archived or deleted this
+// conversation". Instagram gives this same answer when one commenter has
+// closed their DMs and when it refuses every new conversation from the account
+// (observed twice for hours on a busy reel, at about 134 and 85 private replies
+// an hour). recordThreadRefusal tells the two apart by counting refusals across
+// commenters.
 function isThreadRefusal(error: unknown): boolean {
   return (
     error instanceof MetaApiError &&
-    /thread owner has archived or deleted this conversation/i.test(error.message)
+    (error.subcode === 2534001 ||
+      /thread owner has archived or deleted this conversation/i.test(error.message))
   );
 }
 
@@ -356,7 +359,7 @@ async function holdComment(
         status: "SKIPPED_RATE_LIMIT",
         matchedKeyword,
         errorMessage:
-          "Instagram DM rate limit reached (hourly cap, or Meta throttling the account)",
+          "Instagram DM rate limit reached (hourly cap, or Instagram throttling the account)",
         ...clearClaim,
       },
     });
@@ -372,7 +375,7 @@ async function holdComment(
         heldMessage ??
         (rateLimit.slotAt
           ? "Waiting for its send slot (comment DMs are paced); retry scheduled"
-          : "Rate limited (hourly cap, or Meta throttling the account); retry scheduled"),
+          : "Rate limited (hourly cap, or Instagram throttling the account); retry scheduled"),
       ...clearClaim,
     },
   });
@@ -877,7 +880,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: null,
         },
       });
-      // Enough of these in a row and a remembered block is over.
+      // The account can still open conversations: start the refusal count again.
       await recordDelivery(instagramAccountId).catch((recordError) =>
         console.error(
           "[DM Worker] Failed to record a delivery:",
@@ -904,8 +907,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       }
       // Instagram refusing every new conversation from the account: pause it,
       // and hold this comment for when the block lifts instead of dropping it.
-      // A comment refused on every try is still final, so one genuinely closed
-      // thread cannot keep the account paused.
+      // The refusals before the burst was recognised fail as usual; their
+      // retries come back during the pause and are held then. A comment
+      // refused on every try is still final, so one genuinely closed thread
+      // cannot keep the account paused.
       const accountBlocked =
         !delivered &&
         isThreadRefusal(sendError) &&

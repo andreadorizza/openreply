@@ -1,3 +1,5 @@
+<p align="center">Questions or suggestions? <a href="https://discord.gg/p8DCB3USpM">Join the Discord</a>.</p>
+
 <div align="center">
 
 # OpenReply
