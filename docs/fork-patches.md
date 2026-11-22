@@ -4,7 +4,7 @@ This repository is a fork of [diwenne/openreply](https://github.com/diwenne/open
 
 Every fork patch is temporary. When upstream ships a fix for the same problem, the fork drops its own code and uses upstream's fix, even if the fork's version is more complete. If upstream fixes only part of the problem, the fork keeps only the part upstream does not cover, built on upstream's structure.
 
-Last checked against upstream `c78b2d2` and upstream's open pull requests on 2026-11-12.
+Last checked against upstream `eeabe32` on 2026-11-22.
 
 ## How to use this file
 
@@ -27,17 +27,17 @@ Pull request andreadorizza/openreply#7: commits `415fb7a`, `8db470e` and `6e2269
 
 - `COMMENT_DM_MAX_PER_HOUR`, off by default, gives each comment DM its own evenly spaced send slot per account in Redis. A comment over the rate waits in the queue for its slot, for up to a day, instead of being sent at once. Production uses `90`.
 - Three or more 2534001 refusals from different commenters within 10 minutes count as an account-wide block. Comment DMs pause for 30 minutes, and the refused comment is held instead of failed. For 6 hours afterwards a single refusal pauses again. Three deliveries in a row clear the block.
-- `pauseDMSends` only extends a pause, so a shorter rate-limit pause cannot cut a block pause short.
+- The block pause uses upstream's `pauseDMSends` (diwenne/openreply#115) with a 30-minute length. `pauseDMSends` only extends a pause, so upstream's 15-minute rate-limit pause cannot cut a block pause short.
 
 **Code.**
 
-- `lib/utils/rate-limiter.ts`: `commentDmIntervalMs`, the slot logic in `reserveDMSlot`, `recordThreadRefusal`, `recordDelivery`, `releaseHeldSlot`, the Lua scripts they run, and the `SLOT_*`, `MAX_HELD_REQUEUE_ATTEMPTS`, `MAX_PACED_HOLD_MS`, `THREAD_REFUSAL_*`, `ACCOUNT_BLOCK_*` and `DELIVERIES_TO_CLEAR_BLOCK` constants.
+- `lib/utils/rate-limiter.ts`: `commentDmIntervalMs`, the slot logic in `reserveDMSlot`, `recordThreadRefusal`, `recordDelivery`, `releaseHeldSlot`, the pacing branch of `RESERVE_DM_SLOT_SCRIPT` and the other Lua scripts they run, and the `SLOT_*`, `MAX_PACED_HOLD_MS`, `THREAD_REFUSAL_*`, `ACCOUNT_BLOCK_*` and `DELIVERIES_TO_CLEAR_BLOCK` constants.
 - `lib/queue/dm-worker.ts`: `isThreadRefusal`, `holdComment` and the account-block path.
 - `lib/queue/client.ts`: `slotAt` on `ProcessCommentJob`.
 - `docs/setup.md`: the `COMMENT_DM_MAX_PER_HOUR` table and the paragraph after it.
 - Tests: `__tests__/rate-limiter.test.ts`, `__tests__/rate-limiter-redis.test.ts` (runs only when `TEST_REDIS_URL` is set) and the pacing and hold cases in `__tests__/dm-worker.test.ts`.
 
-**Upstream status.** Upstream has nothing equivalent. diwenne/openreply#114 (open) adds a random delay before each reply, per account. That makes replies look less automated, but it does not limit DMs per hour or detect a block, so it does not replace this patch. If #114 is merged, it changes the same files (`lib/queue/dm-worker.ts`, `lib/queue/client.ts`, `lib/queue/process-webhook.ts`). Keep both: a delayed DM job must still take a pacing slot and can still be held during a block.
+**Upstream status.** Upstream has nothing equivalent. Upstream's per-account pause on a Meta rate limit (diwenne/openreply#115, merged as `c02e083`) is the base the block hold builds on; it neither paces DMs nor detects a block. diwenne/openreply#114 (not merged as of `eeabe32`) adds a random delay before each reply, per account. That makes replies look less automated, but it does not limit DMs per hour or detect a block, so it does not replace this patch. If #114 is merged, it changes the same files (`lib/queue/dm-worker.ts`, `lib/queue/client.ts`, `lib/queue/process-webhook.ts`). Keep both: a delayed DM job must still take a pacing slot and can still be held during a block.
 
 **Remove when.**
 
@@ -46,19 +46,7 @@ Pull request andreadorizza/openreply#7: commits `415fb7a`, `8db470e` and `6e2269
 
 Delete this entry only when both parts are gone.
 
-## 2. Back off when Meta throttles sends
-
-Commit `78d1eb6`.
-
-**Why.** On a busy post, Meta started answering every send with code 613 ("the rate limit has exceeded"). Upstream did not classify 613 as a rate limit, so the worker kept sending, and good comments failed alongside bad ones. Delivered DMs fell from about 200 an hour to about 5 an hour.
-
-**What the fork does.** Codes 613 and 80002 throw `RateLimitError`. A `RateLimitError` pauses the account's sends for 15 minutes (`pauseDMSends`). While the account is paused, `reserveDMSlot` refuses a slot and the job is requeued for the end of the pause, with up to 2 minutes of jitter. Other accounts are not affected.
-
-**Code.** `lib/meta/client.ts` (the two `case` lines); `lib/utils/rate-limiter.ts` (`pauseDMSends`, the pause check in `reserveDMSlot`, `META_PAUSE_*`); the rate-limit branch in `lib/queue/dm-worker.ts`; tests in `__tests__/meta-errors.test.ts`, `__tests__/rate-limiter.test.ts` and `__tests__/dm-worker.test.ts`.
-
-**Remove when.** Upstream classifies 613 and 80002 as rate limits and pauses or delays sends for that account when they occur.
-
-## 3. Stop retrying private replies that Meta refuses for good
+## 2. Stop retrying private replies that Meta refuses for good
 
 Commits `c72c20c` and `78d1eb6`.
 
@@ -70,7 +58,7 @@ Commits `c72c20c` and `78d1eb6`.
 
 **Remove when.** Upstream stops retrying these refusals and stops the sweep from queueing them again.
 
-## 4. Bind "next reel" campaigns to a reel posted after they were armed
+## 3. Bind "next reel" campaigns to a reel posted after they were armed
 
 Commit `c72c20c` (upstream later adopted the rest of that commit).
 
@@ -82,7 +70,7 @@ Commit `c72c20c` (upstream later adopted the rest of that commit).
 
 **Remove when.** Upstream records when a campaign was armed for the next reel, or otherwise stops binding to reels posted before that. Keep the column if upstream's fix uses it; otherwise remove it with a new migration rather than editing the old one.
 
-## 5. Build on Vercel without a database URL
+## 4. Build on Vercel without a database URL
 
 Commit `6e6571f`.
 
@@ -92,7 +80,7 @@ Commit `6e6571f`.
 
 **Remove when.** Upstream's `vercel-build` no longer fails without `DATABASE_URL`.
 
-## 6. Stream a loading screen
+## 5. Stream a loading screen
 
 Commit `59235e0`.
 

@@ -1,5 +1,9 @@
 import Link from "next/link";
-import PublicSiteHeader from "@/components/public-site-header";
+import { SitePage } from "@/components/site/shell";
+import { ArrowUpRightIcon } from "@/components/site/icons";
+import { InstagramDm } from "@/components/site/instagram";
+import { Faq } from "@/components/site/faq";
+import { Reveal } from "@/components/site/reveal";
 
 export interface SeoPageSection {
   title: string;
@@ -29,155 +33,128 @@ export interface SeoPageConfig {
 
 export default function SeoPageShell({ config }: { config: SeoPageConfig }) {
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <PublicSiteHeader />
-
-      <section className="border-b border-white/10 bg-zinc-950/70">
-        <div className="mx-auto grid w-full max-w-7xl gap-10 px-5 py-20 sm:px-6 lg:grid-cols-[1.05fr_0.95fr] lg:px-8">
+    <SitePage>
+      <section className="wrap page-hero">
+        <div className="page-hero-grid">
           <div>
-            <p className="text-sm font-bold uppercase text-cyan-200">
-              {config.eyebrow}
-            </p>
-            <h1 className="mt-4 text-5xl font-black leading-tight text-white sm:text-6xl">
-              {config.title}
-            </h1>
-            <p className="mt-6 max-w-2xl text-lg leading-8 text-zinc-400">
-              {config.description}
-            </p>
-            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-              <Link
-                href="/login"
-                className="inline-flex items-center justify-center bg-cyan-300 px-6 py-3 text-sm font-bold text-zinc-950 transition hover:bg-cyan-200"
-              >
-                {config.primaryCta}
+            <span className="eyebrow">{config.eyebrow}</span>
+            <h1 className="heading-2">{config.title}</h1>
+            <p className="page-hero-sub body-3">{config.description}</p>
+            <div className="hero-actions">
+              <Link href="/login" className="btn btn-primary btn-lg button-md">
+                {config.primaryCta} <ArrowUpRightIcon />
               </Link>
-              <Link
-                href="/templates"
-                className="inline-flex items-center justify-center border border-white/10 bg-white/[0.04] px-6 py-3 text-sm font-bold text-white transition hover:border-white/20 hover:bg-white/[0.08]"
-              >
+              <Link href="/templates" className="link button-sm">
                 {config.secondaryCta ?? "Browse templates"}
               </Link>
             </div>
           </div>
-
-          <div className="border border-white/10 bg-white/[0.035] p-6">
-            <p className="text-xs font-bold uppercase tracking-wide text-zinc-500">
-              Campaign OS checklist
-            </p>
-            <ul className="mt-5 space-y-4">
-              {config.bullets.map((bullet) => (
-                <li key={bullet} className="flex gap-3 text-sm leading-6 text-zinc-300">
-                  {bullet}
-                </li>
-              ))}
-            </ul>
+          <div className="hero-phone">
+            <InstagramDm />
           </div>
         </div>
       </section>
 
-      <section className="mx-auto w-full max-w-7xl px-5 py-16 sm:px-6 lg:px-8">
-        <div className="grid gap-4 md:grid-cols-3">
-          {config.sections.map((section) => (
-            <article key={section.title} className="border border-white/10 bg-white/[0.035] p-6">
-              <h2 className="text-2xl font-black text-white">{section.title}</h2>
-              <p className="mt-4 text-sm leading-7 text-zinc-400">{section.body}</p>
-            </article>
-          ))}
+      <section className="section wrap" style={{ paddingTop: 16 }}>
+        <div className="panel">
+          <p className="panel-label">Campaign OS checklist</p>
+          <ul className="checklist body-6" data-cols="2">
+            {config.bullets.map((bullet) => (
+              <li key={bullet}>{bullet}</li>
+            ))}
+          </ul>
         </div>
       </section>
 
-      <section className="border-y border-white/10 bg-white/[0.025] py-16">
-        <div className="mx-auto w-full max-w-7xl px-5 sm:px-6 lg:px-8">
-          <h2 className="text-4xl font-black text-white">{config.comparisonTitle}</h2>
-          <div className="mt-8 overflow-hidden border border-white/10">
-            <div className="grid grid-cols-[0.8fr_1fr_1fr] border-b border-white/10 bg-zinc-950 text-xs font-bold uppercase tracking-wide text-zinc-500">
-              <div className="p-4">Need</div>
-              <div className="p-4 text-cyan-100">OpenReply</div>
-              <div className="p-4">Generic automation</div>
+      <section className="section wrap" style={{ paddingTop: 0 }}>
+        <ul className="card-grid">
+          {config.sections.map((section, i) => (
+            <li key={section.title}>
+              <Reveal className="card" delay={i * 80}>
+                <h2 className="heading-6">{section.title}</h2>
+                <p className="body-6">{section.body}</p>
+              </Reveal>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className="section wrap" style={{ paddingTop: 0 }}>
+        <Reveal>
+          <h2 className="heading-4" style={{ marginBottom: 32 }}>
+            {config.comparisonTitle}
+          </h2>
+          <div className="compare body-6">
+            <div className="compare-row">
+              <div>Need</div>
+              <div>OpenReply</div>
+              <div>Generic automation</div>
             </div>
             {config.comparisons.map((item) => (
-              <div
-                key={item.label}
-                className="grid grid-cols-1 border-b border-white/10 last:border-0 md:grid-cols-[0.8fr_1fr_1fr]"
-              >
-                <div className="bg-zinc-950/50 p-4 text-sm font-semibold text-white">
-                  {item.label}
-                </div>
-                <div className="p-4 text-sm leading-6 text-zinc-300">
-                  {item.ours}
-                </div>
-                <div className="p-4 text-sm leading-6 text-zinc-500">
-                  {item.other}
-                </div>
+              <div key={item.label} className="compare-row">
+                <div>{item.label}</div>
+                <div>{item.ours}</div>
+                <div>{item.other}</div>
               </div>
             ))}
           </div>
-        </div>
+        </Reveal>
       </section>
 
-      <section className="mx-auto grid w-full max-w-7xl gap-8 px-5 py-16 sm:px-6 lg:grid-cols-[0.9fr_1.1fr] lg:px-8">
-        <div>
-          <p className="text-sm font-bold uppercase text-emerald-200">
-            Start from a template
-          </p>
-          <h2 className="mt-3 text-4xl font-black text-white">
-            Launch a campaign faster than building a chatbot flow
-          </h2>
-          <p className="mt-5 text-sm leading-7 text-zinc-400">
-            Use a campaign template, connect the right Instagram account, pick
-            the post, and ship a measurable comment-to-DM loop.
-          </p>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-2">
-          {config.templateLinks.map((link) => (
-            <Link
-              key={link.href}
-              href={link.href}
-              className="border border-white/10 bg-white/[0.035] p-5 text-sm font-semibold text-white transition hover:border-cyan-200/30 hover:bg-cyan-300/10"
-            >
-              {link.label}
-            </Link>
-          ))}
-        </div>
-      </section>
-
-      <section className="border-t border-white/10 bg-zinc-950/70 py-16">
-        <div className="mx-auto grid w-full max-w-7xl gap-8 px-5 sm:px-6 lg:grid-cols-[0.8fr_1.2fr] lg:px-8">
-          <div>
-            <p className="text-sm font-bold uppercase text-cyan-200">FAQ</p>
-            <h2 className="mt-3 text-4xl font-black text-white">
-              Search questions, answered clearly
+      <section className="section wrap" style={{ paddingTop: 0 }}>
+        <div className="split">
+          <Reveal>
+            <span className="eyebrow">Start from a template</span>
+            <h2 className="heading-4">
+              Launch a campaign faster than building a chatbot flow
             </h2>
-          </div>
-          <div className="grid gap-3">
-            {config.faqs.map((faq) => (
-              <article key={faq.title} className="border border-white/10 bg-white/[0.035] p-5">
-                <h3 className="text-lg font-bold text-white">{faq.title}</h3>
-                <p className="mt-2 text-sm leading-6 text-zinc-400">{faq.body}</p>
-              </article>
-            ))}
-          </div>
+            <p className="body-6 muted" style={{ marginTop: 16 }}>
+              Use a campaign template, connect the right Instagram account, pick
+              the post, and ship a measurable comment-to-DM loop.
+            </p>
+          </Reveal>
+          <Reveal delay={80}>
+            <div className="link-grid">
+              {config.templateLinks.map((link) => (
+                <Link key={link.href} href={link.href} className="link-tile body-5">
+                  {link.label}
+                  <ArrowUpRightIcon />
+                </Link>
+              ))}
+            </div>
+          </Reveal>
         </div>
       </section>
 
-      <section className="mx-auto w-full max-w-7xl px-5 py-16 sm:px-6 lg:px-8">
-        <div className="border border-cyan-200/20 bg-cyan-300/10 p-8 text-center">
-          <h2 className="text-4xl font-black text-white">
+      <section className="section wrap" style={{ paddingTop: 0 }}>
+        <div className="faq">
+          <Reveal>
+            <span className="eyebrow">FAQ</span>
+            <h2 className="heading-4">Common questions</h2>
+          </Reveal>
+          <Reveal delay={80}>
+            <Faq items={config.faqs.map((faq) => ({ q: faq.title, a: faq.body }))} />
+          </Reveal>
+        </div>
+      </section>
+
+      <section className="closing wrap" style={{ paddingTop: 0 }}>
+        <Reveal>
+          <h2 className="heading-3">
             Turn the next high-intent comment into a private reply
           </h2>
-          <p className="mx-auto mt-4 max-w-2xl text-sm leading-7 text-zinc-300">
-            OpenReply is built for Instagram professional accounts, official
-            Meta private replies, and campaign reporting teams can show clients.
+          <p className="body-3" style={{ maxWidth: 560, marginInline: "auto" }}>
+            OpenReply works with Instagram professional accounts and official
+            Meta private replies, and its campaign reports are ones you can show
+            clients.
           </p>
-          <Link
-            href="/login"
-            className="mt-8 inline-flex items-center justify-center bg-cyan-300 px-6 py-3 text-sm font-bold text-zinc-950 transition hover:bg-cyan-200"
-          >
-            Start free
-          </Link>
-        </div>
+          <div className="hero-actions">
+            <Link href="/login" className="btn btn-primary btn-lg button-md">
+              Start free <ArrowUpRightIcon />
+            </Link>
+          </div>
+        </Reveal>
       </section>
-    </main>
+    </SitePage>
   );
 }
-

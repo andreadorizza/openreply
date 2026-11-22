@@ -36,8 +36,18 @@ const INSTAGRAM_OAUTH_ENV = [
   "NEXTAUTH_SECRET",
 ] as const;
 
+// Unified login authenticates as the Meta app itself, not its Instagram app.
+const UNIFIED_OAUTH_ENV = [
+  "META_LOGIN_CONFIG_ID",
+  "META_APP_ID",
+  "FACEBOOK_APP_SECRET",
+  "ENCRYPTION_KEY",
+  "NEXTAUTH_SECRET",
+] as const;
+
 export function getMissingInstagramOAuthEnv(): string[] {
-  return INSTAGRAM_OAUTH_ENV.filter((name) => {
+  const required = isUnifiedLogin() ? UNIFIED_OAUTH_ENV : INSTAGRAM_OAUTH_ENV;
+  return required.filter((name) => {
     const value = process.env[name];
     if (!value) return true;
     // A malformed key fails later inside encryptToken, after the user has
@@ -50,14 +60,36 @@ export function getMetaGraphApiVersion(): string {
   return process.env.META_GRAPH_API_VERSION ?? "v25.0";
 }
 
+// Meta apps created from October 2026 only offer "API setup with Unified
+// login" (issues #103, #104). Setting the login configuration's ID makes new
+// connections go through Unified login, with META_APP_ID and
+// FACEBOOK_APP_SECRET (App settings > Basic). It decides only how accounts
+// connect: each account records the login that issued its token, so accounts
+// already connected through Instagram Login keep working either way.
+export function isUnifiedLogin(): boolean {
+  return Boolean(process.env.META_LOGIN_CONFIG_ID);
+}
+
 /**
- * The public demo, and the only host where sign-in is blocked. This repo is
- * something other people clone and deploy; a self-hoster's own domain must
- * never match this and must never be blocked from logging in — that's the
- * entire point of self-hosting. Keep this in sync with
- * components/demo-notice.tsx, which uses the same host for its banner.
+ * The public demo hosts, and the only hosts where sign-in is blocked. This repo
+ * is something other people clone and deploy; a self-hoster's own domain must
+ * never match these and must never be blocked from logging in — that's the
+ * entire point of self-hosting. components/demo-notice.tsx uses the same list
+ * for its banner.
  */
-export const DEMO_HOST = "openreply.diwen.dev";
+export const DEMO_HOSTS = [
+  "openreply.diwen.dev",
+  "openreply.dev",
+  "www.openreply.dev",
+] as const;
+
+/** The first demo host, shown when the banner is rendered without a browser. */
+export const DEMO_HOST = DEMO_HOSTS[0];
+
+/** True when a hostname (port already removed) is one of the public demo hosts. */
+export function isDemoHostname(hostname: string): boolean {
+  return (DEMO_HOSTS as readonly string[]).includes(hostname.toLowerCase());
+}
 
 /**
  * True when the current request is hitting the public demo host. Sign-in is
@@ -71,7 +103,7 @@ export const DEMO_HOST = "openreply.diwen.dev";
 export async function isPublicDemoHost(): Promise<boolean> {
   const { headers } = await import("next/headers");
   const host = (await headers()).get("host") ?? "";
-  return host.split(":")[0].toLowerCase() === DEMO_HOST;
+  return isDemoHostname(host.split(":")[0]);
 }
 
 /**

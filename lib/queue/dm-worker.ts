@@ -356,7 +356,7 @@ async function holdComment(
         status: "SKIPPED_RATE_LIMIT",
         matchedKeyword,
         errorMessage:
-          "Instagram DM rate limit reached (hourly cap, or Instagram throttling the account)",
+          "Instagram DM rate limit reached (hourly cap, or Meta throttling the account)",
         ...clearClaim,
       },
     });
@@ -372,7 +372,7 @@ async function holdComment(
         heldMessage ??
         (rateLimit.slotAt
           ? "Waiting for its send slot (comment DMs are paced); retry scheduled"
-          : "Rate limited (hourly cap, or Instagram throttling the account); retry scheduled"),
+          : "Rate limited (hourly cap, or Meta throttling the account); retry scheduled"),
       ...clearClaim,
     },
   });

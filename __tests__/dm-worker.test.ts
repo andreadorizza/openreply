@@ -308,6 +308,13 @@ beforeEach(() => {
   mockGetUserFollowStatus.mockResolvedValue(true);
 });
 
+
+// An account connected through Instagram Login, as every pre-Unified-login row
+// is: the worker hands its decrypted token to the Meta client with its login.
+const META_AUTH = expect.objectContaining({
+  accessToken: "decrypted_token",
+  unifiedLogin: false,
+});
 describe("DM Worker — comments left on an ad", () => {
   it("also matches the organic post the ad was created from", async () => {
     const processor = getProcessor();
@@ -377,7 +384,7 @@ describe("DM Worker — Full Pipeline", () => {
     expect(mockReleaseDMSlot).not.toHaveBeenCalled();
     expect(mockDecryptToken).toHaveBeenCalledWith("encrypted_token_abc");
     expect(mockSendPrivateReply).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -570,7 +577,7 @@ describe("DM Worker — Full Pipeline", () => {
     await processor(createMockJob(jobDataWithoutName as typeof mockJobData));
 
     expect(mockSendPrivateReply).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey there! Here is the link: https://example.com"
@@ -606,7 +613,7 @@ describe("DM Worker — Full Pipeline", () => {
     // with the commenter's recipient token.
     const token = hashRecipientId(mockJobData.commenterId);
     expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the offer:",
@@ -641,7 +648,7 @@ describe("DM Worker — Full Pipeline", () => {
     // The follow prompt goes out with a `followcheck:` postback button; the
     // link is NOT delivered yet.
     expect(mockSendPrivateReplyWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Follow me first commenter_user, then tap 👇",
@@ -678,7 +685,7 @@ describe("DM Worker — Full Pipeline", () => {
     // Confirmed follower: no prompt, link delivered right away.
     expect(mockSendPrivateReplyWithButton).not.toHaveBeenCalled();
     expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the offer:",
@@ -715,7 +722,7 @@ describe("DM Worker — Full Pipeline", () => {
 
     // Opening DM goes out first; its button routes into the follow check.
     expect(mockSendPrivateReplyWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user, welcome!",
@@ -753,7 +760,7 @@ describe("DM Worker — Full Pipeline", () => {
       },
     });
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -855,7 +862,7 @@ describe("DM Worker — Full Pipeline", () => {
     );
 
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -1063,6 +1070,17 @@ describe("DM Worker — one private reply per comment", () => {
       expect.objectContaining({ requeueAttempt: 1 }),
       expect.objectContaining({ delay: 600_000 })
     );
+  });
+
+  it("should not pause the account for other send failures", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(100, undefined, undefined, "The comment is invalid for a private reply")
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toThrow();
+    expect(mockPauseDMSends).not.toHaveBeenCalled();
   });
 
   it("should keep retrying failures that can clear up", async () => {
@@ -1449,7 +1467,7 @@ describe("DM Worker — DM keyword trigger", () => {
       })
     );
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -1532,7 +1550,7 @@ describe("DM Worker — DM keyword trigger", () => {
     await processor(createMockMessageJob());
 
     expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       expect.any(String),
@@ -1996,7 +2014,7 @@ describe("DM Worker — follow-gate re-check", () => {
     // Tapping the opening DM is not a claim to follow, so there is nothing to
     // wait for: the follow prompt goes out now, not after the re-check delay.
     expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       expect.any(String),
@@ -2034,7 +2052,7 @@ describe("DM Worker — follow re-check acknowledgement", () => {
     await getProcessor()(createMockPostbackJob(tap));
 
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Dame unos segundos que lo verifico"
