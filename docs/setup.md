@@ -9,7 +9,7 @@ If you use a coding assistant, start with [Set it up with an AI assistant](#set-
 | Connection | What you configure | Costs |
 | --- | --- | --- |
 | **[Zernio](zernio.md), recommended for simpler connection setup** | A Zernio API key in Settings, a profile, and an Instagram account. OpenReply registers the webhook. No own Meta app or Meta secrets required. | Optional paid provider, plus your hosting. Zernio sponsors OpenReply. |
-| **[Your own Meta app](#the-meta-app)** | Your Meta app, Instagram Login, app secrets, webhook, and App Review where required. | Your hosting and any other services you use. No Zernio subscription. |
+| **[Your own Meta app](#the-meta-app)** | Your Meta app, Instagram Login or Unified login, app secrets, webhook, and App Review where required. | Your hosting and any other services you use. No Zernio subscription. |
 
 Both use the official Instagram API and remain subject to Instagram’s policies, account requirements, permissions, rate limits, and messaging windows. Both need PostgreSQL, Redis, email delivery, and a running worker. Existing connections are not migrated automatically.
 
@@ -113,9 +113,11 @@ Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway
 | Variable | What it is |
 | --- | --- |
 | `META_GRAPH_API_VERSION` | Graph API version, for example `v25.0`. |
-| `INSTAGRAM_APP_ID` | From the Meta app, see Step 6. |
-| `INSTAGRAM_APP_SECRET` | From the Meta app. |
-| `FACEBOOK_APP_SECRET` | From the Meta app. |
+| `INSTAGRAM_APP_ID` | Instagram Login only. From the Meta app, see Step 5. |
+| `INSTAGRAM_APP_SECRET` | Instagram Login only. From the Meta app. |
+| `FACEBOOK_APP_SECRET` | From the Meta app. Also the client secret for Unified login. |
+| `META_LOGIN_CONFIG_ID` | Unified login only. Set it to connect new accounts through Unified login, see [Apps that only offer Unified login](#apps-that-only-offer-unified-login). |
+| `META_APP_ID` | Unified login only. App settings, Basic, App ID. |
 | `WEBHOOK_VERIFY_TOKEN` | Any random string. You paste the same value into Meta's webhook config. |
 
 `ENCRYPTION_KEY` must be exactly 64 hex characters or the app throws on boot.
@@ -155,7 +157,12 @@ Go to [developers.facebook.com/apps](https://developers.facebook.com/apps) and c
 - App type: Business.
 - Contact email: one you actually check.
 
-When it asks you to add a use case, filter to All, then choose Manage messaging and content on Instagram. Do not pick "Create and manage ads with Marketing API", and do not pick "Authenticate with Facebook Login". OpenReply uses Instagram Login. Picking the Facebook Login variant makes the OAuth flow fail later with a mismatched client error.
+When it asks you to add a use case, filter to All, then choose Manage messaging and content on Instagram. Do not pick "Create and manage ads with Marketing API", and do not pick "Authenticate with Facebook Login". Picking the Facebook Login variant makes the OAuth flow fail later with a mismatched client error.
+
+Inside that use case, check which API setup Meta offers you:
+
+- **API setup with Instagram login.** Follow Steps 5 to 9 as written.
+- **Only API setup with Unified login.** This is what apps created from October 2026 get. Connecting with the Instagram Login steps fails with `Invalid platform app`. Follow [Apps that only offer Unified login](#apps-that-only-offer-unified-login) instead of Steps 5, 7 and 8, then come back for Steps 6 and 9.
 
 If you accidentally added the Marketing API use case, remove it. It has its own heavy review requirements and can block publishing.
 
@@ -230,6 +237,33 @@ https://your-app.vercel.app/terms
 ```
 
 Then publish. Depending on your access level, Meta may let you go live for your own tester accounts immediately, or it may require App Review first (see the last section).
+
+### Apps that only offer Unified login
+
+Unified login connects the Instagram account through a Meta login configuration instead of Instagram Login. The client can log in with Instagram or with Facebook, and no Facebook Page is needed. The token belongs to the client's business portfolio, and OpenReply calls `graph.facebook.com` with it instead of `graph.instagram.com`.
+
+Accounts connected earlier through Instagram Login keep working. Each account records the login it was connected through, so they keep using `graph.instagram.com` and their 60-day token refresh after you turn Unified login on. Setting the variables below changes only how new connections log in.
+
+1. **Create a login configuration.** In the use case, open API setup with Unified login, then Configure your app, then Create new configuration. Keep `instagram_basic`, `instagram_manage_messages` and `instagram_manage_comments`, and add `instagram_manage_insights` for the analytics pages. OpenReply does not use the ads permissions or an ad account.
+2. **Add `business_management` to the same configuration.** The Unified login permission editor does not offer it. Add the Facebook Login for Business product to the app, open its Configurations, click Edit on the same configuration (keep the same configuration ID), and add `business_management` in the permissions step. Without it the login succeeds but the token cannot see any Instagram account: connecting fails with "No Instagram account is assigned to this login", and direct Graph calls fail with `code=100 sub=33`.
+3. **Register the redirect.** In the configuration's Redirect URL field, enter `https://your-app.vercel.app/api/instagram/callback` and save.
+4. **Set the environment variables** on Vercel and the worker:
+
+   | Variable | Where it lives |
+   | --- | --- |
+   | `META_LOGIN_CONFIG_ID` | The configuration's ID. Setting it switches new connections to Unified login. |
+   | `META_APP_ID` | App settings, Basic, App ID. The Meta app's own ID, not an Instagram app ID. |
+   | `FACEBOOK_APP_SECRET` | App settings, Basic, App secret. It also verifies the webhook signatures. |
+
+   `INSTAGRAM_APP_ID` and `INSTAGRAM_APP_SECRET` are not used for Unified login. Keep them if this deployment also has accounts connected through Instagram Login.
+5. **Configure the webhook** on the API setup with Unified login tab. Use the same callback URL, verify token and fields as Step 8 (`comments` and `messages`). OpenReply subscribes each account it connects.
+6. **Add testers.** Until App Review, only accounts with a role on the app can connect. Invite your Instagram account from Generate access tokens, Add account, and accept the invite in Instagram as in Step 6.
+
+When someone clicks Connect Instagram, they choose their business portfolio and Instagram accounts in Meta's dialog. One login can grant several accounts, and OpenReply connects each one the workspace is allowed to add. The configuration decides when the token expires, and Settings shows that date. OpenReply cannot refresh a Unified login token, so connect the account again before that date. A token that never expires shows "not available".
+
+To connect clients without a role on your app, the app needs Advanced Access to every permission in the configuration, `business_management` included, through App Review. One report in issue #104: on an app whose `public_profile` had only Standard Access, the consent screen listed `business_management` but the token silently left it out.
+
+To move an existing account from Instagram Login to Unified login, connect it again from Settings after setting the variables. It keeps its campaigns and history. Meta warns that an account can receive duplicate webhook notifications while both authorizations exist, so check DM Logs after you switch.
 
 ### Publishing is not Advanced Access: every account still needs a role on the app
 
@@ -320,6 +354,21 @@ For your provider to reach local webhooks, run an HTTPS tunnel and set `NEXTAUTH
 ngrok http 3000
 ```
 
+### Run the whole stack in Docker
+
+To run OpenReply on one always-on machine (a home server, a VPS, your own PC) without Node installed, `docker-compose.app.yml` adds the web app, the worker and the cron scheduler on top of Postgres and Redis. All three run from the image built by the `Dockerfile`:
+
+```bash
+cp .env.example .env      # fill in the values, see "Environment variables"
+docker compose -f docker-compose.yml -f docker-compose.app.yml up -d --build
+```
+
+- The web app is on port 3000. Point your tunnel or reverse proxy at it, and set `NEXTAUTH_URL` to that public URL.
+- Migrations run each time the web container starts.
+- `DATABASE_URL` and `REDIS_URL` from `.env` are replaced inside the containers by the compose service names, because `localhost` there is the container itself. If you changed the credentials in `docker-compose.yml`, set `DOCKER_DATABASE_URL` and `DOCKER_REDIS_URL` in `.env`.
+- The cron service runs `scripts/cron.sh`, which needs `CRON_SECRET`. Without it the Instagram token is never refreshed and expires after 60 days.
+- Every service restarts by itself after a reboot or a Docker restart. To deploy code changes, run the same `up -d --build` command again.
+
 ## Set it up with an AI assistant
 
 Open a clone of this repository in your coding assistant and paste the prompt below. Keep real credentials in your deployment’s secret settings or local `.env`, not committed files.
@@ -358,8 +407,10 @@ Work through this order. Ask for decisions or actions only I can supply:
      connection flow to add one, then import it. Keep campaign automation in
      OpenReply; do not create a duplicate campaign in Zernio.
    - Direct Meta: follow the Meta app section in docs/setup.md. Ask for Meta
-     secrets only on this path. Configure the redirect, webhook, tester roles,
-     and publishing; explain Advanced Access/App Review where required.
+     secrets only on this path. Check whether the app offers "API setup with
+     Instagram login" or only "API setup with Unified login" and follow the
+     matching steps. Configure the redirect, webhook, tester roles, and
+     publishing; explain Advanced Access/App Review where required.
 
 6. Test a campaign with keyword TEST. Have a DIFFERENT Instagram account
    comment on the selected post. Confirm a DM and a SENT row in DM Logs.

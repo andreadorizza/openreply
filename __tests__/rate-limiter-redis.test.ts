@@ -53,6 +53,13 @@ describe.skipIf(!redisUrl)("rate limiter scripts on Redis", () => {
       expect(held.requeueDelayMs).toBeGreaterThan(590_000);
       expect(held.slotAt).toBeUndefined();
     });
+
+    it("sends again once the pause ends", async () => {
+      await rl.pauseDMSends(ig, 600_000);
+      expect((await rl.reserveDMSlot(ig)).allowed).toBe(false);
+      await endPause();
+      expect((await rl.reserveDMSlot(ig)).allowed).toBe(true);
+    });
   });
 
   describe("pauseDMSends", () => {

@@ -1,4 +1,4 @@
-import Link from "next/link";
+import { SitePage } from "@/components/site/shell";
 
 interface LegalShellProps {
   title: string;
@@ -14,33 +14,15 @@ export default function LegalShell({
   children,
 }: LegalShellProps) {
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <header className="border-b border-border">
-        <div className="mx-auto flex h-16 max-w-5xl items-center justify-between px-5">
-          <Link href="/" className="flex items-center gap-3">
-            <span className="text-lg font-bold text-foreground">OpenReply</span>
-          </Link>
-          <Link
-            href="/login"
-            className="text-sm font-semibold text-muted transition hover:text-foreground"
-          >
-            Sign in
-          </Link>
-        </div>
-      </header>
-
-      <article className="mx-auto max-w-3xl px-5 py-14">
-        <p className="text-sm font-semibold uppercase text-accent">
-          Last updated {updatedAt}
+    <SitePage>
+      <article className="wrap-narrow legal">
+        <span className="eyebrow-chip caption-4">Last updated {updatedAt}</span>
+        <h1 className="heading-3">{title}</h1>
+        <p className="body-3 muted" style={{ marginTop: 16 }}>
+          {description}
         </p>
-        <h1 className="mt-4 text-4xl font-black text-foreground sm:text-5xl">
-          {title}
-        </h1>
-        <p className="mt-5 text-base leading-8 text-muted">{description}</p>
-        <div className="mt-10 space-y-8 text-sm leading-7 text-foreground">
-          {children}
-        </div>
+        <div className="legal-body body-3">{children}</div>
       </article>
-    </main>
+    </SitePage>
   );
 }

@@ -26,7 +26,7 @@ export const manychatAlternativePage: SeoPageConfig = {
     },
     {
       title: "Agency proof",
-      body: "Tracked links and shareable reports make it easier to show clients what happened after the comment, not just that a message was sent.",
+      body: "Tracked links and shareable reports let you show clients what happened after the comment, including how many people clicked.",
     },
     {
       title: "Meta-first delivery",
@@ -68,7 +68,7 @@ export const templatesSeoPage: SeoPageConfig = {
   eyebrow: "Instagram comment-to-DM templates",
   title: "Instagram comment-to-DM templates for high-intent campaign replies",
   description:
-    "Start with proven campaign patterns for product links, lead magnets, price replies, launch waitlists, coaching offers, events, and local services.",
+    "Start from campaign patterns for product links, lead magnets, price replies, launch waitlists, coaching offers, events, and local services.",
   primaryCta: "Use a template",
   bullets: [
     "Template intent carries into signup and campaign creation.",
@@ -169,7 +169,7 @@ export const agenciesSeoPage: SeoPageConfig = {
   faqs: [
     {
       title: "How many Instagram accounts can agencies connect?",
-      body: "The Agency plan is shaped for up to 10 connected Instagram professional accounts in the current launch packaging.",
+      body: "The Agency plan is meant for up to 10 connected Instagram professional accounts at launch.",
     },
     {
       title: "Can clients see reports without logging in?",
