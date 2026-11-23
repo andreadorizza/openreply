@@ -1002,7 +1002,7 @@ describe("DM Worker — one private reply per comment", () => {
     });
   });
 
-  it("should spend the comment's send budget on a thread Instagram will not open", async () => {
+  it("should fail an isolated thread refusal as before, but count it", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
     mockSendPrivateReply.mockRejectedValue(
       new MetaApiError(
@@ -1014,19 +1014,19 @@ describe("DM Worker — one private reply per comment", () => {
     );
 
     const processor = getProcessor();
-    await expect(processor(createMockJob())).rejects.toMatchObject({
-      name: "UnrecoverableError",
-    });
+    await expect(processor(createMockJob())).rejects.toThrow(
+      "The thread owner has archived or deleted this conversation"
+    );
 
-    // Without this the comment sweep re-sends it every five minutes.
     expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: "FAILED", attempts: 3 }),
+        data: expect.objectContaining({ status: "FAILED" }),
       })
     );
     // Counted, in case it turns out to be part of an account-wide block.
     expect(mockRecordThreadRefusal).toHaveBeenCalledWith("ig_456", "commenter_999");
     expect(mockPauseDMSends).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 
   it("should keep retrying failures that can clear up", async () => {

@@ -129,10 +129,6 @@ const NON_TEMPLATE_REJECTIONS = [
   /outside of allowed window/i,
   /invalid for a private reply/i,
   /requested user cannot be found/i,
-  // sub=2534001. Observed failing identically on all three retries, minutes
-  // apart, for every affected comment. Final for one commenter; a burst of them
-  // is an account-wide block instead, see isThreadRefusal.
-  /thread owner has archived or deleted this conversation/i,
 ];
 
 // Code 100, subcode 2534001: "the thread owner has archived or deleted this
@@ -154,7 +150,10 @@ const ACCOUNT_BLOCK_HOLD_MESSAGE =
 
 // Every pattern above is a verdict on the comment or conversation, so the job
 // retries (5, 15, 45 minutes later) fail identically: three alerts for one
-// comment and a log row that reads like a transient outage.
+// comment and a log row that reads like a transient outage. 2534001 (see
+// isThreadRefusal) is deliberately not here: the refusals that start a block
+// cannot be told apart from a closed thread yet, and their retries are what
+// gets them held once the block is recognised.
 function isPermanentRejection(error: unknown): boolean {
   if (error instanceof TokenExpiredError || error instanceof RateLimitError) {
     return false;

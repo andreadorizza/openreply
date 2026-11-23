@@ -21,9 +21,9 @@ When you add fork-only code, add an entry here in the same pull request. `git di
 
 Commits `c72c20c` and `78d1eb6`.
 
-**Why.** Upstream retried refusals that never succeed ("invalid for a private reply", closed messaging window, "user cannot be found", "thread owner has archived or deleted this conversation"). Each retry raised the same alert, and the comment sweep queued the same comments again on every pass, which added load during a throttle.
+**Why.** Upstream retried refusals that never succeed ("invalid for a private reply", closed messaging window, "user cannot be found"). Each retry raised the same alert, and the comment sweep queued the same comments again on every pass, which added load during a throttle.
 
-**What the fork does.** `isPermanentRejection` matches the messages in `NON_TEMPLATE_REJECTIONS`. Such a refusal fails the job once (`UnrecoverableError`) and uses up the comment's send budget, so the sweep stops queueing it again. A 2534001 refusal is first checked as a possible account-wide block by upstream's `isThreadRefusal` (diwenne/openreply#116); only a refusal that is not part of a block fails for good.
+**What the fork does.** `isPermanentRejection` matches the messages in `NON_TEMPLATE_REJECTIONS`. Such a refusal fails the job once (`UnrecoverableError`) and uses up the comment's send budget, so the sweep stops queueing it again. A 2534001 refusal ("thread owner has archived or deleted this conversation") is not on that list: it may be the start of an account-wide block (upstream's `isThreadRefusal`, diwenne/openreply#116), so it is retried as upstream does, and the retries are held once the block is recognised.
 
 **Code.** `lib/queue/dm-worker.ts` (`isPermanentRejection`, `NON_TEMPLATE_REJECTIONS`, `describeSendFailure`); tests in `__tests__/dm-worker.test.ts`.
 
