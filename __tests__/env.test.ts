@@ -2,6 +2,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   getEncryptionKeyHex,
   getMetaGraphApiVersion,
+  getMissingInstagramOAuthEnv,
+  isDemoHostname,
   isEmailAllowedToSignIn,
   requireEnv,
 } from "../lib/env";
@@ -28,6 +30,23 @@ describe("environment helpers", () => {
     expect(getMetaGraphApiVersion()).toBe("v25.0");
     vi.stubEnv("META_GRAPH_API_VERSION", "v26.0");
     expect(getMetaGraphApiVersion()).toBe("v26.0");
+  });
+
+  it("asks for the variables of the login new connections will use", () => {
+    vi.stubEnv("ENCRYPTION_KEY", "a".repeat(64));
+    vi.stubEnv("NEXTAUTH_SECRET", "secret");
+    vi.stubEnv("INSTAGRAM_APP_ID", "ig");
+    vi.stubEnv("INSTAGRAM_APP_SECRET", "ig-secret");
+    vi.stubEnv("META_APP_ID", "");
+    vi.stubEnv("FACEBOOK_APP_SECRET", "");
+    vi.stubEnv("META_LOGIN_CONFIG_ID", "");
+    expect(getMissingInstagramOAuthEnv()).toEqual([]);
+
+    vi.stubEnv("META_LOGIN_CONFIG_ID", "config");
+    expect(getMissingInstagramOAuthEnv()).toEqual([
+      "META_APP_ID",
+      "FACEBOOK_APP_SECRET",
+    ]);
   });
 });
 
@@ -58,5 +77,21 @@ describe("sign-in allowlist", () => {
     expect(isEmailAllowedToSignIn(null)).toBe(false);
     expect(isEmailAllowedToSignIn(undefined)).toBe(false);
     expect(isEmailAllowedToSignIn("")).toBe(false);
+  });
+});
+
+describe("demo hosts", () => {
+  it("matches the public demo domains", () => {
+    expect(isDemoHostname("openreply.diwen.dev")).toBe(true);
+    expect(isDemoHostname("openreply.dev")).toBe(true);
+    expect(isDemoHostname("www.openreply.dev")).toBe(true);
+    expect(isDemoHostname("OpenReply.dev")).toBe(true);
+  });
+
+  it("never matches a self-hosted domain", () => {
+    expect(isDemoHostname("localhost")).toBe(false);
+    expect(isDemoHostname("replies.example.com")).toBe(false);
+    expect(isDemoHostname("notopenreply.dev")).toBe(false);
+    expect(isDemoHostname("openreply.dev.example.com")).toBe(false);
   });
 });

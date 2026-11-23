@@ -11,7 +11,9 @@ import {
   sendDirectMessageWithLinkButton,
   getRecentMediaComments,
   getUserFollowStatus,
+  getUserInfo,
   getUserMedia,
+  sendPrivateReply,
 } from "@/lib/instagram/provider";
 import { zernioRequest } from "@/lib/zernio/client";
 import { RateLimitError, TokenExpiredError } from "@/lib/meta/client";
@@ -40,6 +42,7 @@ describe("Instagram provider boundary", () => {
     expect(
       await createInstagramContext({
         provider: "ZERNIO",
+        metaLogin: "INSTAGRAM",
         workspaceId: "workspace",
         zernioAccountId: "selected",
         instagramId: "ig",
@@ -49,6 +52,26 @@ describe("Instagram provider boundary", () => {
     expect(prisma.zernioConnection.findUnique).toHaveBeenCalledWith({
       where: { workspaceId: "workspace" },
       select: { apiKey: true },
+    });
+  });
+  it.each([
+    ["INSTAGRAM", false],
+    ["UNIFIED", true],
+  ] as const)("carries a %s account's login into its Meta context", async (metaLogin, unifiedLogin) => {
+    expect(
+      await createInstagramContext({
+        provider: "META",
+        metaLogin,
+        workspaceId: "workspace",
+        zernioAccountId: null,
+        instagramId: "ig1",
+        accessToken: "token",
+      })
+    ).toEqual({
+      provider: "META",
+      accessToken: "decrypted:token",
+      instagramId: "ig1",
+      unifiedLogin,
     });
   });
   it("sends postback private replies using Zernio button contracts", async () => {
@@ -112,21 +135,87 @@ describe("Instagram provider boundary", () => {
     expect(result[0].replies?.data?.[0].from?.id).toBe("ig");
     expect(fetchMock.mock.calls[1][0]).toContain("cursor=next");
   });
+  it("reports the selected account's instagramScopedId as user_id, the id stored for it", async () => {
+    respond({
+      accounts: [
+        { _id: "another", platformUserId: "111", username: "someone", metadata: { instagramScopedId: "17840000000000001" } },
+        {
+          _id: "selected",
+          platformUserId: "26000000000000001",
+          username: "ourbrand",
+          displayName: "Our Brand",
+          followersCount: 3,
+          metadata: {
+            instagramScopedId: "17841400000000001",
+            profileData: { id: "26000000000000001", username: "ourbrand", extraData: { instagramScopedId: "17841400000000001" } },
+          },
+        },
+      ],
+    });
+    const info = await getUserInfo({ context });
+    expect(info.user_id).toBe("17841400000000001");
+    expect(info.username).toBe("ourbrand");
+  });
   it("keeps unavailable follower status unknown", async () => {
     respond({ isFollower: null, unavailableReason: "consent_required" });
     expect(
       await getUserFollowStatus({ context, recipientId: "person" })
     ).toBeNull();
   });
+  const instagramLogin = {
+    provider: "META",
+    accessToken: "meta",
+    instagramId: "ig1",
+    unifiedLogin: false,
+  } as const;
+  const unifiedLogin = { ...instagramLogin, unifiedLogin: true } as const;
+
   it("preserves direct Meta requests", async () => {
     respond({ data: [{ id: "media" }] });
     expect(
-      await getUserMedia({
-        context: { provider: "META", accessToken: "meta" },
-        limit: 3,
-      })
+      await getUserMedia({ context: instagramLogin, limit: 3 })
     ).toEqual([{ id: "media" }]);
-    expect(fetchMock.mock.calls[0][0]).toContain("graph.instagram.com");
+    expect(fetchMock.mock.calls[0][0]).toContain("graph.instagram.com/v");
+    expect(fetchMock.mock.calls[0][0]).toContain("/me/media");
+  });
+  it("keeps Instagram Login accounts on graph.instagram.com when Unified login is configured", async () => {
+    vi.stubEnv("META_LOGIN_CONFIG_ID", "cfg");
+    respond({ data: [{ id: "media" }] });
+    await getUserMedia({ context: instagramLogin, limit: 3 });
+    respond({ success: true });
+    await sendPrivateReply({
+      context: instagramLogin,
+      instagramAccountId: "ig1",
+      commentId: "comment",
+      message: "hi",
+    });
+    expect(fetchMock.mock.calls[0][0]).toContain("graph.instagram.com/v");
+    expect(fetchMock.mock.calls[0][0]).toContain("/me/media");
+    expect(fetchMock.mock.calls[1][0]).toMatch(
+      /^https:\/\/graph\.instagram\.com\/v[\d.]+\/ig1\/messages$/
+    );
+    vi.unstubAllEnvs();
+  });
+  it("addresses Unified login accounts by ID on graph.facebook.com", async () => {
+    respond({ data: [{ id: "media" }] });
+    await getUserMedia({ context: unifiedLogin, limit: 3 });
+    respond({ success: true });
+    await sendPrivateReply({
+      context: unifiedLogin,
+      instagramAccountId: "ig1",
+      commentId: "comment",
+      message: "hi",
+    });
+    respond({ is_user_follow_business: true });
+    await getUserFollowStatus({ context: unifiedLogin, recipientId: "person" });
+    expect(fetchMock.mock.calls[0][0]).toContain("graph.facebook.com/v");
+    expect(fetchMock.mock.calls[0][0]).toContain("/ig1/media");
+    expect(fetchMock.mock.calls[1][0]).toMatch(
+      /^https:\/\/graph\.facebook\.com\/v[\d.]+\/ig1\/messages$/
+    );
+    expect(fetchMock.mock.calls[2][0]).toMatch(
+      /^https:\/\/graph\.facebook\.com\/v[\d.]+\/person\?/
+    );
   });
   it.each([
     [429, RateLimitError],

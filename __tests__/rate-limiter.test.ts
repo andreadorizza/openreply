@@ -48,8 +48,6 @@ import {
   MAX_PACED_HOLD_MS,
   THREAD_REFUSAL_WINDOW_MS,
   THREAD_REFUSAL_BURST,
-  ACCOUNT_BLOCK_MEMORY_MS,
-  DELIVERIES_TO_CLEAR_BLOCK,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -323,14 +321,11 @@ describe("account-wide block", () => {
     await expect(recordThreadRefusal("account_123", "commenter_1")).resolves.toBe(true);
     expect(mockEval).toHaveBeenCalledWith(
       expect.any(String),
-      3,
+      1,
       "rate:dm:refused:account_123",
-      "rate:dm:blocked:account_123",
-      "rate:dm:delivered:account_123",
       expect.any(Number),
       THREAD_REFUSAL_WINDOW_MS,
       THREAD_REFUSAL_BURST,
-      ACCOUNT_BLOCK_MEMORY_MS,
       "commenter_1"
     );
   });
@@ -341,18 +336,10 @@ describe("account-wide block", () => {
     await expect(recordThreadRefusal("account_123", "commenter_1")).resolves.toBe(false);
   });
 
-  it("counts deliveries towards forgetting a block", async () => {
-    mockEval.mockResolvedValue(1);
+  it("starts the refusal count again on a delivery", async () => {
+    mockDel.mockResolvedValue(1);
 
-    await expect(recordDelivery("account_123")).resolves.toBe(true);
-    expect(mockEval).toHaveBeenCalledWith(
-      expect.any(String),
-      3,
-      "rate:dm:blocked:account_123",
-      "rate:dm:refused:account_123",
-      "rate:dm:delivered:account_123",
-      DELIVERIES_TO_CLEAR_BLOCK,
-      ACCOUNT_BLOCK_MEMORY_MS
-    );
+    await recordDelivery("account_123");
+    expect(mockDel).toHaveBeenCalledWith("rate:dm:refused:account_123");
   });
 });

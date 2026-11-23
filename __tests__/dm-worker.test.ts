@@ -278,7 +278,7 @@ beforeEach(() => {
   mockReleaseDMSlot.mockResolvedValue(0);
   mockPauseDMSends.mockResolvedValue(undefined);
   mockRecordThreadRefusal.mockResolvedValue(false);
-  mockRecordDelivery.mockResolvedValue(false);
+  mockRecordDelivery.mockResolvedValue(undefined);
   mockReleaseHeldSlot.mockResolvedValue(undefined);
   mockReleaseWorkspaceDMReservation.mockResolvedValue({ count: 1 });
   mockSendPrivateReply.mockResolvedValue({
@@ -308,6 +308,13 @@ beforeEach(() => {
   mockGetUserFollowStatus.mockResolvedValue(true);
 });
 
+
+// An account connected through Instagram Login, as every pre-Unified-login row
+// is: the worker hands its decrypted token to the Meta client with its login.
+const META_AUTH = expect.objectContaining({
+  accessToken: "decrypted_token",
+  unifiedLogin: false,
+});
 describe("DM Worker — comments left on an ad", () => {
   it("also matches the organic post the ad was created from", async () => {
     const processor = getProcessor();
@@ -377,7 +384,7 @@ describe("DM Worker — Full Pipeline", () => {
     expect(mockReleaseDMSlot).not.toHaveBeenCalled();
     expect(mockDecryptToken).toHaveBeenCalledWith("encrypted_token_abc");
     expect(mockSendPrivateReply).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -570,7 +577,7 @@ describe("DM Worker — Full Pipeline", () => {
     await processor(createMockJob(jobDataWithoutName as typeof mockJobData));
 
     expect(mockSendPrivateReply).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey there! Here is the link: https://example.com"
@@ -606,7 +613,7 @@ describe("DM Worker — Full Pipeline", () => {
     // with the commenter's recipient token.
     const token = hashRecipientId(mockJobData.commenterId);
     expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the offer:",
@@ -641,7 +648,7 @@ describe("DM Worker — Full Pipeline", () => {
     // The follow prompt goes out with a `followcheck:` postback button; the
     // link is NOT delivered yet.
     expect(mockSendPrivateReplyWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Follow me first commenter_user, then tap 👇",
@@ -678,7 +685,7 @@ describe("DM Worker — Full Pipeline", () => {
     // Confirmed follower: no prompt, link delivered right away.
     expect(mockSendPrivateReplyWithButton).not.toHaveBeenCalled();
     expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user! Here is the offer:",
@@ -715,7 +722,7 @@ describe("DM Worker — Full Pipeline", () => {
 
     // Opening DM goes out first; its button routes into the follow check.
     expect(mockSendPrivateReplyWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "comment_555",
       "Hey commenter_user, welcome!",
@@ -753,7 +760,7 @@ describe("DM Worker — Full Pipeline", () => {
       },
     });
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -855,7 +862,7 @@ describe("DM Worker — Full Pipeline", () => {
     );
 
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -974,9 +981,7 @@ describe("DM Worker — one private reply per comment", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           status: "FAILED",
-          errorMessage: expect.stringMatching(
-            /The comment is invalid for a private reply — Instagram refused/
-          ),
+          errorMessage: expect.stringContaining("The comment is invalid for a private reply"),
         }),
       })
     );
@@ -1024,7 +1029,7 @@ describe("DM Worker — one private reply per comment", () => {
     expect(mockPauseDMSends).not.toHaveBeenCalled();
   });
 
-  it("should pause the account's sends when Meta rate limits a send", async () => {
+  it("should keep retrying failures that can clear up", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
     mockSendPrivateReply.mockRejectedValue(
       new RateLimitError("The rate limit has exceeded. Please retry again after some time")
@@ -1034,12 +1039,60 @@ describe("DM Worker — one private reply per comment", () => {
     await expect(processor(createMockJob())).rejects.not.toMatchObject({
       name: "UnrecoverableError",
     });
+  });
+
+  it("should fail an isolated thread refusal as before, but count it", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(
+        100,
+        2534001,
+        undefined,
+        "The thread owner has archived or deleted this conversation, or the thread does not exist."
+      )
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toThrow(
+      "The thread owner has archived or deleted this conversation"
+    );
+
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED" }),
+      })
+    );
+    // Counted, in case it turns out to be part of an account-wide block.
+    expect(mockRecordThreadRefusal).toHaveBeenCalledWith("ig_456", "commenter_999");
+    expect(mockPauseDMSends).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("should pause the account's sends when Meta rate limits a send", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
+    mockSendPrivateReply.mockRejectedValue(
+      new RateLimitError("The rate limit has exceeded. Please retry again after some time")
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toThrow("The rate limit has exceeded");
 
     expect(mockPauseDMSends).toHaveBeenCalledWith("ig_456");
     // A rate limit is not a verdict on the comment: it keeps its budget.
     for (const [args] of mockPrisma.dmLog.update.mock.calls) {
       expect(args.data).not.toHaveProperty("attempts");
     }
+  });
+
+  it("should not pause the account for other send failures", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(100, undefined, undefined, "The comment is invalid for a private reply")
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toThrow();
+    expect(mockPauseDMSends).not.toHaveBeenCalled();
   });
 
   it("should requeue for when the pause ends instead of sending", async () => {
@@ -1063,18 +1116,6 @@ describe("DM Worker — one private reply per comment", () => {
       expect.objectContaining({ requeueAttempt: 1 }),
       expect.objectContaining({ delay: 600_000 })
     );
-  });
-
-  it("should keep retrying failures that can clear up", async () => {
-    mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
-    mockSendPrivateReply.mockRejectedValue(
-      new RateLimitError("The rate limit has exceeded. Please retry again after some time")
-    );
-
-    const processor = getProcessor();
-    await expect(processor(createMockJob())).rejects.not.toMatchObject({
-      name: "UnrecoverableError",
-    });
   });
 
   it("should still fall back to plain text when the button template itself is rejected", async () => {
@@ -1190,21 +1231,21 @@ describe("DM Worker — Instagram blocking the whole account", () => {
     mockRecordThreadRefusal.mockResolvedValue(true);
 
     const processor = getProcessor();
-    await expect(processor(createMockJob())).rejects.toMatchObject({
-      name: "UnrecoverableError",
-    });
+    await expect(processor(createMockJob())).rejects.toThrow(
+      "The thread owner has archived or deleted this conversation"
+    );
 
     // A genuinely closed thread must not keep the account paused for ever.
     expect(mockPauseDMSends).toHaveBeenCalledWith("ig_456", 1_800_000);
     expect(mockQueueAdd).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: "FAILED", attempts: 3 }),
+        data: expect.objectContaining({ status: "FAILED" }),
       })
     );
   });
 
-  it("counts each delivered DM towards ending a remembered block", async () => {
+  it("starts the refusal count again on each delivered DM", async () => {
     const processor = getProcessor();
     await processor(createMockJob());
 
@@ -1218,9 +1259,9 @@ describe("DM Worker — Instagram blocking the whole account", () => {
     mockRecordThreadRefusal.mockResolvedValue(true);
 
     const processor = getProcessor();
-    await expect(processor(createMockJob())).rejects.toMatchObject({
-      name: "UnrecoverableError",
-    });
+    await expect(processor(createMockJob())).rejects.toThrow(
+      "The thread owner has archived or deleted this conversation"
+    );
     expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 
@@ -1229,13 +1270,13 @@ describe("DM Worker — Instagram blocking the whole account", () => {
     mockRecordThreadRefusal.mockRejectedValue(new Error("redis down"));
 
     const processor = getProcessor();
-    await expect(processor(createMockJob())).rejects.toMatchObject({
-      name: "UnrecoverableError",
-    });
+    await expect(processor(createMockJob())).rejects.toThrow(
+      "The thread owner has archived or deleted this conversation"
+    );
     expect(mockPauseDMSends).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: "FAILED", attempts: 3 }),
+        data: expect.objectContaining({ status: "FAILED" }),
       })
     );
   });
@@ -1449,7 +1490,7 @@ describe("DM Worker — DM keyword trigger", () => {
       })
     );
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Hey commenter_user! Here is the link: https://example.com"
@@ -1532,7 +1573,7 @@ describe("DM Worker — DM keyword trigger", () => {
     await processor(createMockMessageJob());
 
     expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       expect.any(String),
@@ -1996,7 +2037,7 @@ describe("DM Worker — follow-gate re-check", () => {
     // Tapping the opening DM is not a claim to follow, so there is nothing to
     // wait for: the follow prompt goes out now, not after the re-check delay.
     expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       expect.any(String),
@@ -2034,7 +2075,7 @@ describe("DM Worker — follow re-check acknowledgement", () => {
     await getProcessor()(createMockPostbackJob(tap));
 
     expect(mockSendDirectMessage).toHaveBeenCalledWith(
-      "decrypted_token",
+      META_AUTH,
       "ig_456",
       "commenter_999",
       "Dame unos segundos que lo verifico"

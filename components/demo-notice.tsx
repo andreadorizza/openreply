@@ -2,7 +2,7 @@
 
 import { useI18n } from "@/lib/i18n/provider";
 import { useSyncExternalStore } from "react";
-import { DEMO_HOST } from "@/lib/env";
+import { DEMO_HOST, isDemoHostname } from "@/lib/env";
 
 const DISMISS_KEY = "openreply:demo-notice-dismissed";
 const SETUP_DOCS_URL =
@@ -36,7 +36,7 @@ function subscribe(onChange: () => void) {
 /// false. Rendering on the server instead would flash the notice onto every
 /// instance that is not the demo.
 function getSnapshot(): boolean {
-  return window.location.hostname === DEMO_HOST && !isDismissed();
+  return isDemoHostname(window.location.hostname) && !isDismissed();
 }
 
 function getServerSnapshot(): boolean {
@@ -63,11 +63,15 @@ export function DemoNotice({ variant }: { variant: "banner" | "panel" }) {
 
   if (!visible) return null;
 
+  // Only reached in the browser (the server snapshot is always false), so this
+  // names the demo domain the visitor is actually on.
+  const host = typeof window === "undefined" ? DEMO_HOST : window.location.hostname;
+
   if (variant === "banner") {
     return (
       <div className="relative border-b border-orange-200 bg-orange-50">
         <p className="mx-auto w-full max-w-6xl px-10 py-2 text-center text-xs leading-5 text-zinc-700 sm:px-14 sm:text-sm">
-          <span className="font-bold text-zinc-900">{DEMO_HOST}</span> {t("is a demo. OpenReply is self-hosted — signing in here will not send DMs for your account.")}{" "}
+          <span className="font-bold text-zinc-900">{host}</span> {t("is a demo. OpenReply is self-hosted — signing in here will not send DMs for your account.")}{" "}
           <a
             href={SETUP_DOCS_URL}
             target="_blank"
@@ -93,7 +97,7 @@ export function DemoNotice({ variant }: { variant: "banner" | "panel" }) {
   return (
     <div className="relative mb-5 rounded border border-warning/30 bg-warning/10 px-4 py-3 pr-10">
       <p className="text-sm leading-6 text-foreground">
-        <span className="font-semibold">{DEMO_HOST} {t("is a demo instance.")}</span>{" "}
+        <span className="font-semibold">{host} {t("is a demo instance.")}</span>{" "}
         {t("Signing in here will not send DMs for your Instagram account. OpenReply is self-hosted, so it only works on a deployment you run yourself, with your own Meta app and your own domain.")}{" "}
         <a
           href={SETUP_DOCS_URL}
