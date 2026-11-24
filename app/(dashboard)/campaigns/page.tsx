@@ -17,6 +17,8 @@ interface Campaign {
   id: string;
   name: string;
   goal: string | null;
+  posts: { id: string; url: string | null }[];
+  // The first of `posts`, which the card shows.
   postId: string | null;
   postUrl: string | null;
   pendingNextReel: boolean;
@@ -367,6 +369,8 @@ export default function CampaignsPage() {
       <div className="space-y-3">
         {filtered.map((auto) => {
           const videoUrl = auto.postId ? videos[auto.postId] : undefined;
+          // The card shows the first post; a badge counts the others.
+          const otherPosts = Math.max(0, (auto.posts?.length ?? 0) - 1);
           return (
           <div
             key={auto.id}
@@ -377,7 +381,8 @@ export default function CampaignsPage() {
                 to their own line instead of squeezing the campaign summary. */}
             <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
               {auto.postId && thumbnails[auto.postId] && (
-                videoUrl ? (
+                <div className="relative shrink-0">
+                {videoUrl ? (
                   <button
                     type="button"
                     onClick={(e) => {
@@ -415,7 +420,13 @@ export default function CampaignsPage() {
                       }}
                     />
                   </a>
-                )
+                )}
+                {otherPosts > 0 && (
+                  <span className="pointer-events-none absolute -bottom-1.5 -right-1.5 rounded-full border border-border bg-surface px-1.5 text-[10px] font-medium text-muted">
+                    +{otherPosts}
+                  </span>
+                )}
+                </div>
               )}
               <div className="min-w-[12rem] flex-1">
                 <div className="flex flex-wrap items-center gap-2 mb-2">

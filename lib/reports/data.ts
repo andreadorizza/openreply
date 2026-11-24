@@ -10,6 +10,7 @@ import {
 } from "@/lib/tracking/analytics";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
 import { buildReportUrl, isReportBranded } from "@/lib/reports/share";
+import { CAMPAIGN_POST_ORDER } from "@/lib/campaigns/posts";
 
 function getHostname(url: string) {
   try {
@@ -41,7 +42,10 @@ export async function getCampaignReportBySlug(shareSlug: string, locale: Locale 
       workspaceId: true,
       name: true,
       goal: true,
-      postUrl: true,
+      posts: {
+        select: { postUrl: true },
+        orderBy: CAMPAIGN_POST_ORDER,
+      },
       keywords: true,
       isActive: true,
       createdAt: true,
@@ -161,7 +165,10 @@ export async function getCampaignReportBySlug(shareSlug: string, locale: Locale 
     campaign: {
       name: automation.name,
       goal: automation.goal,
-      postUrl: automation.postUrl,
+      // Links to the campaign's posts, first post first.
+      postUrls: automation.posts.flatMap((post) =>
+        post.postUrl ? [post.postUrl] : []
+      ),
       keywords: automation.keywords,
       isActive: automation.isActive,
       createdAt: automation.createdAt,

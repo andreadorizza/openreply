@@ -285,15 +285,29 @@ export default async function ReportPage({ params }: ReportPageProps) {
               <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
                 {t("Source post")}
               </p>
-              {report.campaign.postUrl ? (
+              {report.campaign.postUrls.length === 1 ? (
                 <a
-                  href={report.campaign.postUrl}
+                  href={report.campaign.postUrls[0]}
                   target="_blank"
                   rel="noreferrer"
                   className="mt-3 inline-flex text-sm font-semibold text-cyan-200 transition hover:text-cyan-100"
                 >
                   {t("View Instagram post")}
                 </a>
+              ) : report.campaign.postUrls.length > 1 ? (
+                <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2">
+                  {report.campaign.postUrls.map((url, index) => (
+                    <a
+                      key={url}
+                      href={url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-sm font-semibold text-cyan-200 transition hover:text-cyan-100"
+                    >
+                      {t("Post {number}", { number: index + 1 })}
+                    </a>
+                  ))}
+                </div>
               ) : (
                 <p className="mt-3 text-sm text-zinc-400">{t("Not attached")}</p>
               )}

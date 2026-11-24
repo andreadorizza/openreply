@@ -405,7 +405,6 @@
   "a DM with a link": "含有連結的私訊",
   "a follow requirement first": "先要求追蹤帳號",
   "a follow-up thank-you message": "後續感謝訊息",
-  "a specific post or reel": "指定貼文或 Reels",
   "a specific word or words": "指定關鍵字",
   "also reply when someone DMs": "收到私訊時也回覆",
   "an opening DM": "開場私訊",
@@ -468,5 +467,10 @@
   "{name} Campaign Report": "{name} 活動報表",
   "{type} post": "{type} 貼文",
   "”": "」",
-  "← Campaigns": "← 返回活動列表"
+  "← Campaigns": "← 返回活動列表",
+  "specific posts or reels": "指定的貼文或 Reels",
+  "{count} posts or reels": "{count} 則貼文或 Reels",
+  "Post {number}": "貼文 {number}",
+  "{selected} of {count} selected": "已選取 {selected} / {count}",
+  "Already used by \"{name}\" and {count} more": "已用於「{name}」及其他 {count} 個活動"
 }

@@ -1,20 +1,23 @@
 import { prisma } from "@/lib/db/client";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { CAMPAIGN_POST_ORDER, campaignPostFields } from "@/lib/campaigns/posts";
 import { ApiError } from "./http";
 import { requireScope, type ServiceContext } from "./auth";
 
 const summarySelect = {
   id: true, name: true, goal: true, instagramAccountId: true, isActive: true,
-  postId: true, postUrl: true, pendingNextReel: true, matchAnyPost: true,
+  posts: { select: { postId: true, postUrl: true }, orderBy: CAMPAIGN_POST_ORDER },
+  pendingNextReel: true, matchAnyPost: true,
   keywords: true, matchAnyWord: true, dmMessage: true, createdAt: true, updatedAt: true,
 } as const;
 
 export async function listCampaigns(context: ServiceContext) {
   requireScope(context, "campaigns:read");
-  return prisma.automation.findMany({
+  const campaigns = await prisma.automation.findMany({
     where: { workspaceId: context.workspaceId }, select: summarySelect,
     orderBy: [{ createdAt: "desc" }, { id: "asc" }], take: 100,
   });
+  return campaigns.map(({ posts, ...campaign }) => ({ ...campaign, ...campaignPostFields(posts) }));
 }
 
 export async function getCampaign(context: ServiceContext, id: string) {
@@ -36,8 +39,9 @@ export async function getCampaign(context: ServiceContext, id: string) {
   });
   if (!campaign) throw new ApiError("Campaign not found", 404);
   const [primary, secondary] = campaign.trackedLinks;
+  const { posts, ...rest } = campaign;
   return {
-    ...campaign, trackedDestinationUrl: primary?.destinationUrl ?? null,
+    ...rest, ...campaignPostFields(posts), trackedDestinationUrl: primary?.destinationUrl ?? null,
     secondaryDestinationUrl: secondary?.destinationUrl ?? null,
     secondaryButtonLabel: secondary?.label ?? null,
   };

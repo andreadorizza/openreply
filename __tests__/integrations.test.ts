@@ -128,7 +128,7 @@ describe("read-only MCP and REST", () => {
     expect((await mcp(request({}, { accept: "application/json" }))).status).toBe(406);
   });
   it("keeps REST and MCP details identical and non-cached", async () => {
-    state.campaigns.findFirst.mockResolvedValue({ id: "campaign", trackedLinks: [{ destinationUrl: "https://example.test/primary", label: "Primary", position: 0 }] });
+    state.campaigns.findFirst.mockResolvedValue({ id: "campaign", posts: [], trackedLinks: [{ destinationUrl: "https://example.test/primary", label: "Primary", position: 0 }] });
     const restResponse = await rest(new Request("https://example.test/api/v1/campaigns?id=campaign", { headers }));
     const expected = (await restResponse.json()).data;
     const mcpResponse = await mcp(request({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_campaign", arguments: { id: "campaign" } } }));
@@ -144,7 +144,7 @@ describe("read-only MCP and REST", () => {
   it("does not leak foreign campaigns or invent missing links", async () => {
     state.campaigns.findFirst.mockResolvedValue(null);
     await expect(getCampaign(context, "foreign")).rejects.toMatchObject({ status: 404 });
-    state.campaigns.findFirst.mockResolvedValue({ id: "empty", trackedLinks: [] });
+    state.campaigns.findFirst.mockResolvedValue({ id: "empty", posts: [], trackedLinks: [] });
     expect(await getCampaign(context, "empty")).toMatchObject({ trackedDestinationUrl: null, secondaryDestinationUrl: null, trackedLinks: [] });
   });
 });

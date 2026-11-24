@@ -161,7 +161,7 @@ const mockAutomation = {
   id: "auto_789",
   workspaceId: "workspace_123",
   instagramAccountId: "ig_account_row_1",
-  postId: "media_101",
+  posts: [{ postId: "media_101" }],
   keywords: ["LINK", "PRICE"],
   dmMessage: "Hey {username}! Here is the link: https://example.com",
   isActive: true,
@@ -334,14 +334,42 @@ describe("DM Worker — comments left on an ad", () => {
       expect.objectContaining({
         where: expect.objectContaining({
           OR: [
-            { postId: "ad_media_999" },
-            { postId: "media_101" },
+            {
+              posts: {
+                some: { postId: { in: ["ad_media_999", "media_101"] } },
+              },
+            },
             { matchAnyPost: true },
           ],
         }),
       })
     );
     expect(mockSendPrivateReply).toHaveBeenCalled();
+    // The log records the campaign's post, not the ad.
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ postId: "media_101" }),
+      })
+    );
+  });
+
+  it("matches a campaign with several posts on any of them", async () => {
+    const processor = getProcessor();
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...mockAutomation,
+        posts: [{ postId: "media_100" }, { postId: "media_101" }],
+      },
+    ]);
+
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ postId: "media_101" }),
+      })
+    );
   });
 });
 
@@ -353,13 +381,17 @@ describe("DM Worker — Full Pipeline", () => {
 
     expect(mockPrisma.automation.findMany).toHaveBeenCalledWith({
       where: {
-        OR: [{ postId: "media_101" }, { matchAnyPost: true }],
+        OR: [
+          { posts: { some: { postId: { in: ["media_101"] } } } },
+          { matchAnyPost: true },
+        ],
         isActive: true,
         instagramAccount: { instagramId: "ig_456" },
       },
       include: {
         instagramAccount: true,
         workspace: true,
+        posts: { select: { postId: true } },
         trackedLinks: {
           select: {
             slug: true,
