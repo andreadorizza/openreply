@@ -62,11 +62,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const existing = await prisma.automation.findMany({
-    where: { instagramAccountId: account.id },
+  const existing = await prisma.automationPost.findMany({
+    where: { automation: { instagramAccountId: account.id } },
     select: { postId: true },
   });
-  const usedPostIds = new Set(existing.map((a) => a.postId));
+  const usedPostIds = new Set(existing.map((post) => post.postId));
 
   const created: { name: string; postId: string }[] = [];
   const skipped: { row: number; reason: string }[] = [];
@@ -92,8 +92,9 @@ export async function POST(request: NextRequest) {
       data: {
         name,
         goal: (campaign.goal ?? "").trim().slice(0, 120) || null,
-        postId: campaign.postId,
-        postUrl: campaign.postUrl ?? null,
+        posts: {
+          create: { postId: campaign.postId, postUrl: campaign.postUrl ?? null },
+        },
         keywords: campaign.keywords,
         dmMessage: campaign.dmMessage.slice(0, 1000),
         publicReplyEnabled: Boolean(publicReply),

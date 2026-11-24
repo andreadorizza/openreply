@@ -28,7 +28,7 @@ const baseAutomation = {
   workspaceId: "workspace_123",
   name: "Product Link Drop",
   goal: "Product link request",
-  postUrl: "https://instagram.com/p/example",
+  posts: [{ postUrl: "https://instagram.com/p/example" }],
   keywords: ["LINK", "SHOP"],
   isActive: true,
   createdAt: new Date("2026-05-01T00:00:00.000Z"),

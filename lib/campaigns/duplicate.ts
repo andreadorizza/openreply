@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/db/client";
 import { generateReportShareSlug } from "@/lib/reports/share";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { CAMPAIGN_POST_ORDER, campaignPostRows } from "@/lib/campaigns/posts";
 import { generateTrackedLinkSlug } from "@/lib/tracking/server";
 
 // Matches the campaign name limit the create and update schemas enforce.
@@ -43,14 +44,17 @@ export async function duplicateCampaign({
 }) {
   const source = await prisma.automation.findFirst({
     where: { id: automationId, workspaceId },
-    include: { trackedLinks: { orderBy: TRACKED_LINK_ORDER } },
+    include: {
+      posts: { orderBy: CAMPAIGN_POST_ORDER },
+      trackedLinks: { orderBy: TRACKED_LINK_ORDER },
+    },
   });
 
   if (!source) return null;
 
-  // Every setting on the row carries over. The links are recreated rather than
-  // spread, since they are rows of their own.
-  const { trackedLinks, ...settings } = source;
+  // Every setting on the row carries over. The posts and links are recreated
+  // rather than spread, since they are rows of their own.
+  const { posts, trackedLinks, ...settings } = source;
 
   return prisma.automation.create({
     data: {
@@ -65,6 +69,12 @@ export async function duplicateCampaign({
       name: buildDuplicateName(settings.name),
       isActive: false,
       reportShareSlug: generateReportShareSlug(),
+      // Same posts, in the same order.
+      posts: {
+        create: campaignPostRows(
+          posts.map((post) => ({ id: post.postId, url: post.postUrl }))
+        ),
+      },
       trackedLinks: {
         // Numbered from the order just read, so the copy's buttons match
         // the original's even if the original's positions have gaps or ties.

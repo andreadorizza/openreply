@@ -5,8 +5,8 @@
 /**
  * Post Picker
  *
- * Grid of Instagram post thumbnails, selectable.
- * Fetches from /api/instagram/posts.
+ * Grid of Instagram post thumbnails. Several can be selected; a click toggles
+ * one. Fetches from /api/instagram/posts.
  */
 
 import { useI18n } from "@/lib/i18n/provider";
@@ -25,24 +25,30 @@ interface InstagramPost {
   timestamp: string;
 }
 
+export interface PickedPost {
+  id: string;
+  url: string | null;
+  thumb: string | null;
+  caption: string;
+}
+
 interface PostPickerProps {
-  selectedPostId: string | null;
+  selectedPostIds: string[];
   instagramAccountId?: string | null;
-  /** postId -> name of the campaign already using it. Flagged in the grid. */
-  usedPostIds?: Record<string, string>;
-  onSelect: (
-    postId: string,
-    postUrl?: string,
-    thumbUrl?: string,
-    caption?: string
-  ) => void;
+  /** postId -> names of the campaigns already using it. Flagged in the grid. */
+  usedPostIds?: Record<string, string[]>;
+  /** Once this many are selected, the other posts can't be picked. */
+  maxSelected: number;
+  /** Called with the clicked post: select it, or deselect it if selected. */
+  onToggle: (post: PickedPost) => void;
 }
 
 export default function PostPicker({
-  selectedPostId,
+  selectedPostIds,
   instagramAccountId,
   usedPostIds,
-  onSelect,
+  maxSelected,
+  onToggle,
 }: PostPickerProps) {
   const { t } = useI18n();
   const [limitations, setLimitations] = useState<string[]>([]);
@@ -156,6 +162,12 @@ export default function PostPicker({
         />
         <span className="shrink-0 text-xs text-muted">{posts.length}</span>
       </div>
+      <p className="px-1 text-[11px] text-muted">
+        {t("{selected} of {count} selected", {
+          selected: selectedPostIds.length,
+          count: maxSelected,
+        })}
+      </p>
       {visible.length === 0 ? (
         <p className="py-6 text-center text-sm text-muted">
           {t("No posts match “")}{query}{t("”")}
@@ -173,9 +185,11 @@ export default function PostPicker({
               the square thumbnails flatten into strips. */}
           <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 max-h-64 auto-rows-min content-start overflow-y-auto p-1">
             {visible.map((post) => {
-              const isSelected = selectedPostId === post.id;
-              const usedByName = usedPostIds?.[post.id];
-              const isUsed = Boolean(usedByName) && !isSelected;
+              const isSelected = selectedPostIds.includes(post.id);
+              const usedBy = usedPostIds?.[post.id] ?? [];
+              const isUsed = usedBy.length > 0 && !isSelected;
+              const atLimit =
+                !isSelected && selectedPostIds.length >= maxSelected;
               const thumb = post.thumbnail_url ?? post.media_url;
               const isVideo = post.media_type === "VIDEO";
               const showVideo =
@@ -184,13 +198,30 @@ export default function PostPicker({
           <button
             key={post.id}
             type="button"
-            onClick={() => onSelect(post.id, post.permalink, thumb, post.caption)}
+            onClick={() =>
+              onToggle({
+                id: post.id,
+                url: post.permalink ?? null,
+                thumb: thumb ?? null,
+                caption: post.caption ?? "",
+              })
+            }
+            disabled={atLimit}
             onMouseEnter={() => setHoveredId(post.id)}
             onMouseLeave={() =>
               setHoveredId((cur) => (cur === post.id ? null : cur))
             }
             aria-pressed={isSelected}
-            title={isUsed && usedByName ? t("Already used by \"{name}\"", { name: usedByName }) : undefined}
+            title={
+              !isUsed
+                ? undefined
+                : usedBy.length === 1
+                  ? t("Already used by \"{name}\"", { name: usedBy[0] })
+                  : t("Already used by \"{name}\" and {count} more", {
+                      name: usedBy[0],
+                      count: usedBy.length - 1,
+                    })
+            }
             className={`
               relative aspect-square rounded overflow-hidden border-2
               ${
@@ -200,6 +231,7 @@ export default function PostPicker({
                     ? "border-warning/40 hover:border-warning/60"
                     : "border-border hover:border-border-hover"
               }
+              ${atLimit ? "cursor-not-allowed opacity-40" : ""}
             `}
           >
             {thumb ? (

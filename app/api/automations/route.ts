@@ -16,6 +16,14 @@ import {
 } from "@/lib/campaigns/links";
 import { buildReportUrl, generateReportShareSlug } from "@/lib/reports/share";
 import {
+  CAMPAIGN_POST_ORDER,
+  campaignPostFields,
+  campaignPostRows,
+  campaignPostsInputSchema,
+  requestedCampaignPosts,
+  syncCampaignPosts,
+} from "@/lib/campaigns/posts";
+import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
 } from "@/lib/workspace-access";
@@ -29,6 +37,8 @@ const createAutomationSchema = z
     name: z.string().min(1).max(100),
     goal: z.string().min(1).max(120).optional().nullable(),
     instagramAccountId: z.string().min(1).optional().nullable(),
+    // The chosen posts. `postId` / `postUrl` still set a single post.
+    posts: campaignPostsInputSchema.optional().nullable(),
     postId: z.string().min(1).optional().nullable(),
     postUrl: z.string().url().optional().nullable(),
     pendingNextReel: z.boolean().optional().default(false),
@@ -70,10 +80,13 @@ const createAutomationSchema = z
     isActive: z.boolean().optional().default(true),
     wholeWordMatch: z.boolean().optional().default(true),
   })
-  // A campaign must target a specific post, any post, or the next reel.
+  // A campaign must target chosen posts, any post, or the next reel.
   .refine(
-    (d) => d.matchAnyPost || d.pendingNextReel || Boolean(d.postId),
-    { message: "Choose which post(s) trigger the campaign", path: ["postId"] }
+    (d) =>
+      d.matchAnyPost ||
+      d.pendingNextReel ||
+      (requestedCampaignPosts(d)?.length ?? 0) > 0,
+    { message: "Choose which post(s) trigger the campaign", path: ["posts"] }
   )
   // And it must match either specific words or any word.
   .refine((d) => d.matchAnyWord || d.keywords.length >= 1, {
@@ -93,6 +106,7 @@ const updateAutomationSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   goal: z.string().min(1).max(120).optional().nullable(),
   instagramAccountId: z.string().min(1).optional(),
+  posts: campaignPostsInputSchema.optional().nullable(),
   postId: z.string().min(1).optional().nullable(),
   postUrl: z.string().url().optional().nullable(),
   pendingNextReel: z.boolean().optional(),
@@ -154,6 +168,10 @@ export async function GET(request: NextRequest) {
       },
       _count: {
         select: { dmLogs: true },
+      },
+      posts: {
+        select: { postId: true, postUrl: true },
+        orderBy: CAMPAIGN_POST_ORDER,
       },
       trackedLinks: {
         select: {
@@ -267,6 +285,7 @@ export async function GET(request: NextRequest) {
 
       return {
         ...automation,
+        ...campaignPostFields(automation.posts),
         trackedLinks: automation.trackedLinks.map((link) => ({
           ...link,
           trackedUrl: buildTrackedUrl(link.slug),
@@ -360,8 +379,12 @@ export async function POST(request: NextRequest) {
 
   const { pendingNextReel, matchAnyPost, matchAnyWord, openingDmEnabled } =
     parsed.data;
-  // A post is only stored for the "specific post" trigger.
-  const isSpecificPost = !pendingNextReel && !matchAnyPost;
+  // Posts are only stored for the "specific posts" trigger. A next-reel
+  // campaign has none yet; the cron adds the reel once it is posted.
+  const posts =
+    !pendingNextReel && !matchAnyPost
+      ? requestedCampaignPosts(parsed.data) ?? []
+      : [];
   const publicReplyList = (
     parsed.data.publicReplyMessages.length > 0
       ? parsed.data.publicReplyMessages
@@ -376,9 +399,9 @@ export async function POST(request: NextRequest) {
     data: {
       name: parsed.data.name,
       goal: parsed.data.goal,
-      // A next-reel campaign has no post yet; the cron binds it once a reel is posted.
-      postId: isSpecificPost ? parsed.data.postId : null,
-      postUrl: isSpecificPost ? parsed.data.postUrl : null,
+      ...(posts.length > 0
+        ? { posts: { create: campaignPostRows(posts) } }
+        : {}),
       pendingNextReel,
       nextReelArmedAt: pendingNextReel ? new Date() : null,
       matchAnyPost,
@@ -425,12 +448,16 @@ export async function POST(request: NextRequest) {
         : {}),
     },
     include: {
+      posts: { orderBy: CAMPAIGN_POST_ORDER },
       trackedLinks: true,
     },
   });
 
   return NextResponse.json(
-    { success: true, data: automation },
+    {
+      success: true,
+      data: { ...automation, ...campaignPostFields(automation.posts) },
+    },
     { status: 201 }
   );
 }
@@ -490,8 +517,16 @@ export async function PATCH(request: NextRequest) {
     trackedDestinationUrl,
     secondaryDestinationUrl,
     secondaryButtonLabel,
+    posts: postsInput,
+    postId,
+    postUrl,
     ...automationData
   } = parsed.data;
+  let requestedPosts = requestedCampaignPosts({
+    posts: postsInput,
+    postId,
+    postUrl,
+  });
 
   // Moving a campaign to another account: it must be one of this workspace's.
   if (
@@ -525,10 +560,19 @@ export async function PATCH(request: NextRequest) {
     automationData.followUpMessage = null;
     automationData.followUpDelayMinutes = 0;
   }
-  // Any-post / next-reel campaigns carry no specific post.
+  // Any-post / next-reel campaigns carry no chosen posts.
   if (automationData.matchAnyPost === true || automationData.pendingNextReel === true) {
-    automationData.postId = null;
-    automationData.postUrl = null;
+    requestedPosts = [];
+  }
+  // A campaign on chosen posts needs at least one.
+  const choosesPosts =
+    !(automationData.matchAnyPost ?? existing.matchAnyPost) &&
+    !(automationData.pendingNextReel ?? existing.pendingNextReel);
+  if (choosesPosts && requestedPosts?.length === 0) {
+    return NextResponse.json(
+      { success: false, error: "Choose at least one post" },
+      { status: 400 }
+    );
   }
   // Keep the public-reply variations list and the legacy single field in sync.
   if (automationData.publicReplyMessages !== undefined) {
@@ -557,10 +601,14 @@ export async function PATCH(request: NextRequest) {
   // first locks its row, which makes a second save of the same campaign wait
   // for this one before it reads the links.
   const updated = await prisma.$transaction(async (tx) => {
-    const campaign = await tx.automation.update({
+    await tx.automation.update({
       where: { id: automationId },
       data: { ...automationData, nextReelArmedAt },
     });
+
+    if (requestedPosts !== undefined) {
+      await syncCampaignPosts(tx, automationId, requestedPosts);
+    }
 
     await syncCampaignLinks(tx, {
       workspaceId,
@@ -570,10 +618,16 @@ export async function PATCH(request: NextRequest) {
       secondaryLabel: secondaryButtonLabel,
     });
 
-    return campaign;
+    return tx.automation.findUniqueOrThrow({
+      where: { id: automationId },
+      include: { posts: { orderBy: CAMPAIGN_POST_ORDER } },
+    });
   });
 
-  return NextResponse.json({ success: true, data: updated });
+  return NextResponse.json({
+    success: true,
+    data: { ...updated, ...campaignPostFields(updated.posts) },
+  });
 }
 
 export async function DELETE(request: NextRequest) {

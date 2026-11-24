@@ -5,6 +5,7 @@ const { mockPrisma, mockSyncCampaignLinks } = vi.hoisted(() => {
   const mockPrisma = {
     automation: {
       findFirst: vi.fn(),
+      findUniqueOrThrow: vi.fn(),
       update: vi.fn(),
     },
     instagramAccount: {
@@ -56,6 +57,10 @@ beforeEach(() => {
   mockPrisma.automation.update.mockImplementation(async ({ data }) => ({
     id: "automation_123",
     ...data,
+  }));
+  mockPrisma.automation.findUniqueOrThrow.mockImplementation(async () => ({
+    id: "automation_123",
+    posts: [],
   }));
   mockPrisma.$transaction.mockImplementation(async (fn) => fn(mockPrisma));
 });

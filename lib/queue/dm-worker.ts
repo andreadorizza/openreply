@@ -61,6 +61,7 @@ import {
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { campaignPostForComment } from "@/lib/campaigns/posts";
 import { hashRecipientId } from "@/lib/tracking/server";
 
 import { ZernioApiError } from "@/lib/zernio/client";
@@ -424,13 +425,20 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
   const automations = await prisma.automation.findMany({
     where: {
       ...connectionScope(job.data),
-      // Match campaigns bound to this specific post, plus any-post campaigns.
-      // A comment left on an ad carries the ad's own media id, while the
-      // campaign is bound to the post the ad was created from, so both ids
+      // Match campaigns that have this post among their posts, plus any-post
+      // campaigns. A comment left on an ad carries the ad's own media id,
+      // while the campaign holds the post the ad was created from, so both ids
       // have to be considered or the comment is dropped without a trace.
       OR: [
-        { postId: mediaId },
-        ...(originalMediaId ? [{ postId: originalMediaId }] : []),
+        {
+          posts: {
+            some: {
+              postId: {
+                in: originalMediaId ? [mediaId, originalMediaId] : [mediaId],
+              },
+            },
+          },
+        },
         { matchAnyPost: true },
       ],
       isActive: true,
@@ -441,6 +449,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     include: {
       instagramAccount: true,
       workspace: true,
+      posts: { select: { postId: true } },
       trackedLinks: {
         select: {
           slug: true,
@@ -471,6 +480,12 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     if (!matchResult.matched) {
       continue;
     }
+
+    const postId = campaignPostForComment(
+      automation.posts.map((post) => post.postId),
+      mediaId,
+      originalMediaId
+    );
 
     const existingLog = await prisma.dmLog.findUnique({
       where: {
@@ -521,6 +536,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commenterName,
           commentText,
           commentId,
+          postId,
           matchedKeyword: matchResult.matchedKeyword,
           status: "FAILED",
           errorMessage: "No Instagram access token available",
@@ -555,6 +571,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commenterName,
           commentText,
           commentId,
+          postId,
           matchedKeyword: matchResult.matchedKeyword,
           status: "FAILED",
           errorMessage: "Failed to decrypt Instagram access token",
@@ -573,7 +590,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         workspaceId: automation.workspaceId,
         automationId: automation.id,
         instagramAccountId: automation.instagramAccountId,
-        commenterId, commenterName, commentText, commentId,
+        commenterId, commenterName, commentText, commentId, postId,
         matchedKeyword: matchResult.matchedKeyword,
         status: "PENDING",
       },
