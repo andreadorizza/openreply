@@ -86,7 +86,7 @@ describe("comment polling does not recreate unsafe sends", () => {
         id: "campaign",
         name: "Campaign",
         workspaceId: "workspace",
-        postId: POST,
+        posts: [{ postId: POST }],
         matchAnyWord: false,
         keywords: ["AI"],
         publicReplyEnabled: true,
@@ -135,4 +135,62 @@ describe("comment polling does not recreate unsafe sends", () => {
         expect(data.commentId).toBe("new");
     },
   );
+});
+
+describe("campaigns with several posts", () => {
+  const SECOND = "18023946917554991";
+
+  beforeEach(() => {
+    queueAdd.mockReset();
+    readComments.mockReset();
+    mockPrisma.operationalEvent.create.mockResolvedValue({});
+    mockPrisma.dmLog.findMany.mockResolvedValue([]);
+    // Only the first post was boosted.
+    mockPrisma.$queryRaw.mockImplementation(async (_sql, postId) =>
+      postId === POST ? [{ mediaId: AD }] : []
+    );
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        id: "campaign",
+        name: "Campaign",
+        workspaceId: "workspace",
+        posts: [{ postId: POST }, { postId: SECOND }],
+        matchAnyWord: false,
+        keywords: ["AI"],
+        publicReplyEnabled: false,
+        instagramAccount: {
+          id: "connection",
+          instagramId: "owner",
+          provider: "META",
+          accessToken: "test",
+        },
+      },
+    ]);
+    readComments.mockImplementation(async ({ mediaId }) => [
+      {
+        id: `comment-on-${mediaId}`,
+        text: "AI",
+        from: { id: "reader" },
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+  });
+
+  it("sweeps every post and the ads made from them", async () => {
+    await reconcileComments();
+
+    const swept = readComments.mock.calls.map(([args]) => args.mediaId);
+    expect(swept).toEqual([POST, AD, SECOND]);
+  });
+
+  it("tells the worker which post an ad comment came from", async () => {
+    await reconcileComments();
+
+    const jobs = queueAdd.mock.calls.map(([, data]) => data);
+    expect(jobs).toEqual([
+      expect.objectContaining({ mediaId: POST, originalMediaId: undefined }),
+      expect.objectContaining({ mediaId: AD, originalMediaId: POST }),
+      expect.objectContaining({ mediaId: SECOND, originalMediaId: undefined }),
+    ]);
+  });
 });

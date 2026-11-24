@@ -195,8 +195,9 @@ model Automation {
 
   name           String
   goal           String?
-  postId         String?
-  postUrl        String?
+  // The posts a "specific posts" campaign listens on are rows in
+  // AutomationPost. Any-post and next-reel campaigns have none until the
+  // next reel is bound.
   pendingNextReel Boolean @default(false)
   // When the campaign started waiting for its next reel. Only a reel posted
   // after this binds it; createdAt is wrong for a campaign switched to "next
@@ -207,7 +208,7 @@ model Automation {
   matchAnyWord   Boolean @default(false)
   // Also fire this campaign when someone sends a DM whose text matches the
   // keywords above. Independent of the post trigger — a DM has no media, so
-  // postId / matchAnyPost do not apply to it.
+  // posts / matchAnyPost do not apply to it.
   dmTriggerEnabled Boolean @default(false)
   dmMessage      String
   openingDmEnabled     Boolean @default(false)
@@ -235,12 +236,27 @@ model Automation {
 
   workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  posts            AutomationPost[]
   dmLogs           DmLog[]
   trackedLinks     TrackedLink[]
   linkClicks       LinkClick[]
 
   @@index([workspaceId])
   @@index([instagramAccountId])
+}
+
+// One post a campaign listens on. A campaign holds up to 10; the oldest row is
+// its first post, which the campaigns list shows as the thumbnail.
+model AutomationPost {
+  id           String   @id @default(cuid())
+  automationId String
+  postId       String
+  postUrl      String?
+  createdAt    DateTime @default(now())
+
+  automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+
+  @@unique([automationId, postId])
   @@index([postId])
 }
 
@@ -254,6 +270,9 @@ model DmLog {
   commenterName String?
   commentText   String
   commentId     String
+  // The campaign post the comment belongs to. A comment on an ad records the
+  // post the ad was made from. Null for DM-triggered sends and older rows.
+  postId        String?
   matchedKeyword String?
   status        DmStatus @default(PENDING)
   attempts      Int      @default(0)

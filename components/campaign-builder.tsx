@@ -16,7 +16,8 @@ import { useI18n } from "@/lib/i18n/provider";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
-import PostPicker from "@/components/post-picker";
+import PostPicker, { type PickedPost } from "@/components/post-picker";
+import { MAX_CAMPAIGN_POSTS } from "@/lib/campaigns/post-limit";
 import CampaignPreview, { type PreviewTab } from "@/components/campaign-preview";
 import { readCache, writeCache } from "@/lib/client-cache";
 import {
@@ -31,8 +32,7 @@ type MatchMode = "specific" | "any";
 interface LoadedCampaign {
   id: string;
   name: string;
-  postId: string | null;
-  postUrl: string | null;
+  posts: { id: string; url: string | null }[];
   pendingNextReel: boolean;
   matchAnyPost: boolean;
   keywords: string[];
@@ -148,15 +148,15 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [isActive, setIsActive] = useState(true);
 
   const [triggerScope, setTriggerScope] = useState<TriggerScope>("specific");
-  const [postId, setPostId] = useState<string | null>(null);
-  const [postUrl, setPostUrl] = useState<string | null>(null);
-  const [postThumb, setPostThumb] = useState<string | null>(null);
-  const [postCaption, setPostCaption] = useState("");
+  // The chosen posts, in the order picked. The first one is the campaign's
+  // thumbnail and the one the preview shows.
+  const [selectedPosts, setSelectedPosts] = useState<PickedPost[]>([]);
+  const previewPost = selectedPosts[0];
 
   // Post IDs already tied to another automation on this account, so the picker
   // can flag them and the user knows not to double-assign. Maps postId ->
-  // the campaign name using it (for the tooltip).
-  const [usedPosts, setUsedPosts] = useState<Record<string, string>>({});
+  // the names of the campaigns using it (for the tooltip).
+  const [usedPosts, setUsedPosts] = useState<Record<string, string[]>>({});
 
   const [matchMode, setMatchMode] = useState<MatchMode>("specific");
   const [keywordText, setKeywordText] = useState("");
@@ -258,8 +258,14 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         setTriggerScope(
           c.matchAnyPost ? "any" : c.pendingNextReel ? "next" : "specific"
         );
-        setPostId(c.postId);
-        setPostUrl(c.postUrl);
+        setSelectedPosts(
+          (c.posts ?? []).map((post) => ({
+            id: post.id,
+            url: post.url,
+            thumb: null,
+            caption: "",
+          }))
+        );
         setMatchMode(c.matchAnyWord ? "any" : "specific");
         setKeywordText(c.keywords.join(", "));
         setWholeWordMatch(c.wholeWordMatch ?? true);
@@ -308,12 +314,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       .then((r) => r.json())
       .then((payload) => {
         if (cancelled || !payload.success) return;
-        const map: Record<string, string> = {};
+        const map: Record<string, string[]> = {};
         for (const a of payload.data as LoadedCampaign[]) {
-          if (!a.postId) continue;
           if (a.instagramAccountId !== selectedAccountId) continue;
           if (mode === "edit" && a.id === campaignId) continue;
-          map[a.postId] = a.name;
+          for (const post of a.posts ?? []) {
+            (map[post.id] ??= []).push(a.name);
+          }
         }
         setUsedPosts(map);
       })
@@ -328,10 +335,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   function prefillFromRow(row: ImportRow) {
     setName(row.name ?? "");
     setTriggerScope("specific");
-    setPostId(null);
-    setPostUrl(null);
-    setPostThumb(null);
-    setPostCaption("");
+    setSelectedPosts([]);
     setMatchMode("specific");
     setKeywordText((row.keywords ?? []).join(", "));
     setDmMessage(row.dmMessage ?? "");
@@ -372,16 +376,14 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const username =
     accounts.find((a) => a.id === selectedAccountId)?.username ?? "yourbrand";
 
-  function handlePostSelect(
-    id: string,
-    url?: string,
-    thumb?: string,
-    caption?: string
-  ) {
-    setPostId(id);
-    setPostUrl(url ?? null);
-    setPostThumb(thumb ?? null);
-    setPostCaption(caption ?? "");
+  function handlePostToggle(post: PickedPost) {
+    setSelectedPosts((current) => {
+      if (current.some((p) => p.id === post.id)) {
+        return current.filter((p) => p.id !== post.id);
+      }
+      if (current.length >= MAX_CAMPAIGN_POSTS) return current;
+      return [...current, post];
+    });
   }
 
   function ensureLinkToken() {
@@ -392,7 +394,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setError(null);
 
     if (!selectedAccountId) return setError(t("Connect an Instagram account first."));
-    if (triggerScope === "specific" && !postId)
+    if (triggerScope === "specific" && selectedPosts.length === 0)
       return setError(t("Pick a post or reel to trigger the campaign."));
     if (matchMode === "specific" && keywords.length === 0)
       return setError(t("Add at least one keyword, or switch to any word."));
@@ -405,8 +407,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     const payload = {
       name: name.trim() || `Campaign for @${username}`,
       instagramAccountId: selectedAccountId,
-      postId: triggerScope === "specific" ? postId : null,
-      postUrl: triggerScope === "specific" ? postUrl : null,
+      posts:
+        triggerScope === "specific"
+          ? selectedPosts.map((post) => ({ id: post.id, url: post.url }))
+          : [],
       matchAnyPost: triggerScope === "any",
       pendingNextReel: triggerScope === "next",
       matchAnyWord: matchMode === "any",
@@ -451,13 +455,17 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             });
       const data = await res.json();
       if (data.success) {
-        // The post we just assigned is now in use. Reflect it immediately so
-        // the picker flags it on the next imported row — the fetch that builds
-        // this map doesn't re-run while the builder stays mounted through the
-        // import queue.
-        if (triggerScope === "specific" && postId) {
-          const assignedPostId = postId;
-          setUsedPosts((prev) => ({ ...prev, [assignedPostId]: payload.name }));
+        // The posts we just assigned are now in use. Reflect it immediately
+        // so the picker flags them on the next imported row — the fetch that
+        // builds this map doesn't re-run while the builder stays mounted
+        // through the import queue.
+        if (triggerScope === "specific") {
+          const assigned = selectedPosts.map((post) => post.id);
+          setUsedPosts((prev) => {
+            const next = { ...prev };
+            for (const id of assigned) next[id] = [...(next[id] ?? []), payload.name];
+            return next;
+          });
         }
         // Importing: advance to the next queued row instead of leaving.
         if (importQueue && importQueue.length > 1) {
@@ -661,9 +669,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                 value={selectedAccountId}
                 onChange={(id) => {
                   setSelectedAccountId(id);
-                  setPostId(null);
-                  setPostUrl(null);
-                  setPostThumb(null);
+                  setSelectedPosts([]);
                 }}
                 includeAll={false}
                 label={t("Instagram account")}
@@ -677,15 +683,16 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             checked={triggerScope === "specific"}
             onSelect={() => setTriggerScope("specific")}
           >
-            {t("a specific post or reel")}
+            {t("specific posts or reels")}
           </Radio>
           {triggerScope === "specific" && (
             <div className="rounded-lg border border-border p-2">
               <PostPicker
-                selectedPostId={postId}
+                selectedPostIds={selectedPosts.map((post) => post.id)}
                 instagramAccountId={selectedAccountId}
                 usedPostIds={usedPosts}
-                onSelect={handlePostSelect}
+                maxSelected={MAX_CAMPAIGN_POSTS}
+                onToggle={handlePostToggle}
               />
             </div>
           )}
@@ -1003,8 +1010,8 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             onTabChange={setPreviewTab}
             username={username}
             avatarUrl={avatarUrl}
-            postThumb={postThumb}
-            caption={postCaption}
+            postThumb={previewPost?.thumb ?? null}
+            caption={previewPost?.caption ?? ""}
             sampleComment={keywords[0] ?? ""}
             dmTriggerEnabled={dmTriggerEnabled}
             publicReplyEnabled={publicReplyEnabled}

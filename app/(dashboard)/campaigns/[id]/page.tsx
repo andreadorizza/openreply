@@ -17,8 +17,7 @@ import CampaignPreview, { type PreviewTab } from "@/components/campaign-preview"
 interface Campaign {
   id: string;
   name: string;
-  postId: string | null;
-  postUrl: string | null;
+  posts: { id: string; url: string | null }[];
   pendingNextReel: boolean;
   matchAnyPost: boolean;
   keywords: string[];
@@ -66,7 +65,8 @@ export default function CampaignDetailPage() {
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
-  const [postThumb, setPostThumb] = useState<string | null>(null);
+  // postId -> thumbnail, for the campaign's posts found among recent media.
+  const [postThumbs, setPostThumbs] = useState<Record<string, string>>({});
   const [tab, setTab] = useState<Tab>("insights");
   const [previewTab, setPreviewTab] = useState<PreviewTab>("dm");
   const [busy, setBusy] = useState(false);
@@ -94,21 +94,24 @@ export default function CampaignDetailPage() {
       )
       .catch(() => setAvatarUrl(null));
 
-    if (campaign.postId) {
+    if (campaign.posts.length > 0) {
+      const wanted = new Set(campaign.posts.map((post) => post.id));
       fetch(`/api/instagram/posts?instagramAccountId=${acct}&limit=50`)
         .then((r) => r.json())
         .then((payload) => {
           if (!payload.success) return;
-          const hit = (
-            payload.data as {
-              id: string;
-              thumbnail_url?: string;
-              media_url?: string;
-            }[]
-          ).find((p) => p.id === campaign.postId);
-          setPostThumb(hit?.thumbnail_url ?? hit?.media_url ?? null);
+          const thumbs: Record<string, string> = {};
+          for (const p of payload.data as {
+            id: string;
+            thumbnail_url?: string;
+            media_url?: string;
+          }[]) {
+            const thumb = p.thumbnail_url ?? p.media_url;
+            if (wanted.has(p.id) && thumb) thumbs[p.id] = thumb;
+          }
+          setPostThumbs(thumbs);
         })
-        .catch(() => setPostThumb(null));
+        .catch(() => setPostThumbs({}));
     }
   }, [campaign]);
 
@@ -157,7 +160,11 @@ export default function CampaignDetailPage() {
     ? t("Any post or reel")
     : campaign.pendingNextReel
       ? t("Your next reel")
-      : t("A specific post or reel");
+      : campaign.posts.length > 1
+        ? t("{count} posts or reels", { count: campaign.posts.length })
+        : t("A specific post or reel");
+  const firstPost = campaign.posts[0];
+  const postThumb = firstPost ? postThumbs[firstPost.id] ?? null : null;
   const matchText = campaign.matchAnyWord
     ? t("Any comment")
     : campaign.keywords.join(", ") || t("No keywords");
@@ -195,6 +202,41 @@ export default function CampaignDetailPage() {
         </div>
 
         <Summary title={t("When someone comments on")}>
+          {campaign.posts.length > 1 ? (
+            <div className="space-y-2">
+              <span className="text-sm text-foreground">{trigger}</span>
+              <div className="flex flex-wrap gap-2">
+                {campaign.posts.map((post) => {
+                  const thumb = postThumbs[post.id];
+                  const tile = thumb ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={thumb}
+                      alt={t("Post")}
+                      className="h-14 w-14 rounded object-cover"
+                    />
+                  ) : (
+                    <div className="grid h-14 w-14 place-items-center rounded bg-surface-hover text-[10px] text-muted">
+                      {t("Post")}
+                    </div>
+                  );
+                  return post.url ? (
+                    <a
+                      key={post.id}
+                      href={post.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded hover:opacity-80"
+                    >
+                      {tile}
+                    </a>
+                  ) : (
+                    <div key={post.id}>{tile}</div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
           <div className="flex items-center gap-3">
             {postThumb ? (
               // eslint-disable-next-line @next/next/no-img-element
@@ -210,6 +252,7 @@ export default function CampaignDetailPage() {
             )}
             <span className="text-sm text-foreground">{trigger}</span>
           </div>
+          )}
         </Summary>
 
         <Summary title={t("And this comment has")}>

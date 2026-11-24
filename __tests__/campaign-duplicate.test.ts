@@ -23,8 +23,6 @@ const sourceCampaign = {
   instagramAccountId: "account_123",
   name: "Product Link Drop",
   goal: "Product link request",
-  postId: "post_123",
-  postUrl: "https://instagram.com/p/example",
   pendingNextReel: false,
   matchAnyPost: false,
   keywords: ["LINK", "SHOP"],
@@ -50,6 +48,22 @@ const sourceCampaign = {
   reportShareEnabled: false,
   createdAt: new Date("2026-05-01T00:00:00.000Z"),
   updatedAt: new Date("2026-05-20T00:00:00.000Z"),
+  posts: [
+    {
+      id: "post_row_1",
+      automationId: "automation_123",
+      postId: "post_123",
+      postUrl: "https://instagram.com/p/example",
+      createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    },
+    {
+      id: "post_row_2",
+      automationId: "automation_123",
+      postId: "post_456",
+      postUrl: null,
+      createdAt: new Date("2026-05-03T00:00:00.000Z"),
+    },
+  ],
   trackedLinks: [
     {
       id: "link_1",
@@ -79,6 +93,7 @@ const NOT_COPIED = new Set([
   "reportShareSlug",
   "createdAt",
   "updatedAt",
+  "posts",
   "trackedLinks",
 ]);
 
@@ -200,9 +215,30 @@ describe("duplicateCampaign", () => {
 
     expect(mockPrisma.automation.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
-        include: { trackedLinks: { orderBy: TRACKED_LINK_ORDER } },
+        include: expect.objectContaining({
+          trackedLinks: { orderBy: TRACKED_LINK_ORDER },
+        }),
       })
     );
+  });
+
+  it("gives the copy the same posts, first post first", async () => {
+    await duplicateCampaign({
+      automationId: "automation_123",
+      workspaceId: "workspace_123",
+    });
+
+    const rows = createArgs().data.posts.create;
+    expect(rows.map((row: { postId: string }) => row.postId)).toEqual([
+      "post_123",
+      "post_456",
+    ]);
+    expect(rows[0]).toMatchObject({ postUrl: "https://instagram.com/p/example" });
+    expect(rows[1]).toMatchObject({ postUrl: null });
+    // The copy's rows are its own: no ids or campaign ids from the original.
+    expect(rows[0]).not.toHaveProperty("id");
+    expect(rows[0]).not.toHaveProperty("automationId");
+    expect(rows[0].createdAt < rows[1].createdAt).toBe(true);
   });
 
   it("numbers the copy's links 0, 1, 2 even when the original's positions are tied", async () => {
