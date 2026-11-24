@@ -61,6 +61,20 @@ Commit `59235e0`.
 
 **Remove when.** Upstream adds a root `loading.tsx` or another Suspense boundary above the dashboard layout.
 
+## 5. Campaigns on several chosen posts
+
+Commit `22f825b`, on branch `feat/multi-post-campaigns`, which is cut from upstream so it can become the upstream pull request unchanged.
+
+**Why.** Trial reels for the same offer share one keyword and one set of links. Upstream lets a campaign listen on one post or on any post, so covering several trial reels meant "any post", which also fires on unrelated posts.
+
+**What the fork does.** A campaign holds up to 10 posts, each a row in `AutomationPost`. The worker, the comment sweep, "next reel", duplication, the API, MCP and the dashboard use them. `DmLog.postId` records which campaign post a comment came from. The design is in `GLOSSARY.md` and `docs/adr/0001-one-row-per-campaign-post.md`.
+
+**Code.** `prisma/schema.prisma` and the migration `20261124120000_campaign_posts`; `lib/campaigns/posts.ts` and `post-limit.ts`; `lib/queue/dm-worker.ts`; `lib/polling/comment-reconciler.ts`; `lib/automation/attach-next-reel.ts`; `lib/campaigns/duplicate.ts`; `app/api/automations/route.ts` and `import/route.ts`; `lib/integrations/campaigns.ts`; `lib/reports/data.ts`; `components/post-picker.tsx` and `campaign-builder.tsx`; the campaigns list, campaign page and report page; the four translation catalogs. Tests in `__tests__/campaign-posts.test.ts`, plus updated fixtures elsewhere.
+
+**Upstream status.** Proposed in diwennee/openreply#135. The pull request waits for the maintainer's reply on the issue and for this fork to run it on real campaigns.
+
+**Remove when.** Upstream merges campaigns with several posts. Keep the migration's name and contents identical in the upstream pull request: this fork's database has already applied it, so an edited copy would fail Prisma's checksum. If upstream ships a different design, move to it with a new migration rather than editing this one.
+
 ## Fork-only by design
 
 - `CLAUDE.md`: the fork policy.

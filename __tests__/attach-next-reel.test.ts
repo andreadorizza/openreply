@@ -52,7 +52,14 @@ describe("attachPendingNextReels", () => {
 
     expect(mockPrisma.automation.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ postId: "reel_new" }),
+        data: expect.objectContaining({
+          pendingNextReel: false,
+          posts: {
+            connectOrCreate: expect.objectContaining({
+              create: expect.objectContaining({ postId: "reel_new" }),
+            }),
+          },
+        }),
       })
     );
   });
@@ -64,7 +71,14 @@ describe("attachPendingNextReels", () => {
 
     expect(mockPrisma.automation.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ postId: "reel_old" }),
+        data: expect.objectContaining({
+          pendingNextReel: false,
+          posts: {
+            connectOrCreate: expect.objectContaining({
+              create: expect.objectContaining({ postId: "reel_old" }),
+            }),
+          },
+        }),
       })
     );
   });
