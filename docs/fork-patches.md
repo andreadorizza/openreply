@@ -1,6 +1,6 @@
 # Fork patches
 
-This repository is a fork of [diwenne/openreply](https://github.com/diwenne/openreply). It carries a few changes that upstream does not have. Each one is listed here with the reason, the code it touches, and the upstream change that would make it unnecessary.
+This repository is a fork of [diwennee/openreply](https://github.com/diwennee/openreply). It carries a few changes that upstream does not have. Each one is listed here with the reason, the code it touches, and the upstream change that would make it unnecessary.
 
 Every fork patch is temporary. When upstream ships a fix for the same problem, the fork drops its own code and uses upstream's fix, even if the fork's version is more complete. If upstream fixes only part of the problem, the fork keeps only the part upstream does not cover, built on upstream's structure.
 
@@ -23,7 +23,7 @@ Commits `c72c20c` and `78d1eb6`.
 
 **Why.** Upstream retried refusals that never succeed ("invalid for a private reply", closed messaging window, "user cannot be found"). Each retry raised the same alert, and the comment sweep queued the same comments again on every pass, which added load during a throttle.
 
-**What the fork does.** `isPermanentRejection` matches the messages in `NON_TEMPLATE_REJECTIONS`. Such a refusal fails the job once (`UnrecoverableError`) and uses up the comment's send budget, so the sweep stops queueing it again. A 2534001 refusal ("thread owner has archived or deleted this conversation") is not on that list: it may be the start of an account-wide block (upstream's `isThreadRefusal`, diwenne/openreply#116), so it is retried as upstream does, and the retries are held once the block is recognised.
+**What the fork does.** `isPermanentRejection` matches the messages in `NON_TEMPLATE_REJECTIONS`. Such a refusal fails the job once (`UnrecoverableError`) and uses up the comment's send budget, so the sweep stops queueing it again. A 2534001 refusal ("thread owner has archived or deleted this conversation") is not on that list: it may be the start of an account-wide block (upstream's `isThreadRefusal`, diwennee/openreply#116), so it is retried as upstream does, and the retries are held once the block is recognised.
 
 **Code.** `lib/queue/dm-worker.ts` (`isPermanentRejection`, `NON_TEMPLATE_REJECTIONS`, `describeSendFailure`); tests in `__tests__/dm-worker.test.ts`.
 
@@ -65,5 +65,7 @@ Commit `59235e0`.
 
 - `CLAUDE.md`: the fork policy.
 - `docs/fork-patches.md`: this file.
+- `GLOSSARY.md`: the domain terms used when designing changes, for the fork and for upstream.
+- `docs/adr/`: design decisions and why they were made.
 
 These stay as long as the fork exists.
